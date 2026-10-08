@@ -682,6 +682,115 @@ def test_quantitative_backtester_simulation():
     assert isinstance(result.max_drawdown_pct, float)
 
 
+def test_adx_and_volume_sma():
+    """Verifies that TimeframeSeries accurately computes Welles Wilder ADX and volume SMA."""
+    tf = TimeframeSeries("BTCUSDT", "1m")
+
+    # Generate 50 trending bars with increasing volume
+    for i in range(50):
+        price = 60000.0 + (i * 20.0)
+        tf.add_or_update_bar(Bar(
+            timestamp=1700000000000 + (i * 60000),
+            open=price - 5.0,
+            high=price + 15.0,
+            low=price - 10.0,
+            close=price,
+            volume=10.0 + i,
+        ))
+
+    vol_sma = tf.calculate_volume_sma(20)
+    assert vol_sma > 0
+    # Average of last 20 bars (30 to 49) = 39.5 + 10 = 49.5
+    assert 45.0 <= vol_sma <= 55.0
+
+    adx, plus_di, minus_di = tf.calculate_adx(14)
+    assert isinstance(adx, float)
+    assert adx > 0.0
+    # In a clean ascending trend, +DI must exceed -DI
+    assert plus_di > minus_di
+
+
+def test_adx_and_macro_regime_filtering():
+    """Verifies that ADX and 15m macro trend correctly suppress low-volatility chop."""
+    cfg = AppConfig()
+    cfg.execution.adx_filter = True
+    cfg.execution.adx_threshold = 25.0
+
+    strat = StrategyEngine(cfg)
+
+    # 1. Flat price action with zero trend (ADX will be near 0)
+    base_t = int(time.time() * 1000) - (60 * 60 * 1000)
+    for i in range(60):
+        t = base_t + (i * 60 * 1000)
+        strat.update_kline("BTCUSDT", "1m", {
+            "start": t,
+            "open": 65000.0,
+            "high": 65002.0,
+            "low": 64998.0,
+            "close": 65000.0,
+            "volume": 5.0,
+            "turnover": 65000.0 * 5.0,
+        })
+
+    ob = OrderBookL2("BTCUSDT")
+    ob.apply_snapshot({"b": [["65000.0", "1.0"]], "a": [["65001.0", "1.0"]], "u": 1})
+
+    regime, metrics = strat.classify_regime("BTCUSDT", ob)
+    # Must be classified as LOW_VOL_CHOP due to flat action and low ADX
+    assert regime == MarketRegime.LOW_VOL_CHOP
+
+
+def test_breakout_tp_atr_mult():
+    """Verifies that Volatility Expansion regime applies expanded breakout TP multiplier."""
+    cfg = AppConfig()
+    cfg.execution.breakout_tp_atr_mult = 2.5
+    cfg.execution.volume_confirmation = False  # Isolate price breakout
+
+    strat = StrategyEngine(cfg)
+
+    base_t = int(time.time() * 1000) - (80 * 60 * 1000)
+    # Seed 60 normal bars with ATR ~ 10
+    for i in range(60):
+        t = base_t + (i * 60 * 1000)
+        strat.update_kline("BTCUSDT", "1m", {
+            "start": t,
+            "open": 60000.0,
+            "high": 60010.0,
+            "low": 59990.0,
+            "close": 60000.0,
+            "volume": 10.0,
+            "turnover": 600000.0,
+        })
+
+    # Add 20 bars with massive volatility expansion (ATR explodes)
+    for i in range(20):
+        t = base_t + ((60 + i) * 60 * 1000)
+        p = 60000.0 + (i * 100.0)
+        strat.update_kline("BTCUSDT", "1m", {
+            "start": t,
+            "open": p - 40.0,
+            "high": p + 120.0,
+            "low": p - 30.0,
+            "close": p + 80.0,
+            "volume": 50.0,
+            "turnover": p * 50.0,
+        })
+
+    ob = OrderBookL2("BTCUSDT")
+    best_ask = 62000.0
+    ob.apply_snapshot({"b": [["61999.0", "1.0"]], "a": [[str(best_ask), "1.0"]], "u": 1})
+    ob.ofi = 25.0
+
+    sig = strat.generate_signal("BTCUSDT", ob)
+    assert sig is not None
+    assert sig.regime == MarketRegime.VOLATILITY_EXPANSION
+    # Verify that TP distance from entry price reflects breakout_tp_atr_mult (2.5 * ATR)
+    expected_tp_dist = round(2.5 * sig.atr, 4)
+    actual_tp_dist = round(sig.tp_price - sig.price, 4)
+    assert abs(actual_tp_dist - expected_tp_dist) < 0.1
+
+
+
 
 
 

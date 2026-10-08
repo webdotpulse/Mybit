@@ -197,6 +197,12 @@ class ExecutionConfig(BaseModel):
         le=5.0,
         description="ATR multiplier for native Take Profit bracket"
     )
+    breakout_tp_atr_mult: float = Field(
+        default=2.2,
+        ge=1.0,
+        le=5.0,
+        description="ATR multiplier for high-conviction breakout Take Profit bracket"
+    )
     bracket_sl_atr_mult: float = Field(
         default=0.8,
         ge=0.2,
@@ -208,16 +214,16 @@ class ExecutionConfig(BaseModel):
         description="Enable dynamic trailing stop adjustment as position moves in profit"
     )
     breakeven_atr_trigger: float = Field(
-        default=0.85,
+        default=1.25,
         ge=0.2,
-        le=2.0,
+        le=3.0,
         description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
     )
     breakeven_buffer_bps: float = Field(
-        default=8.0,
+        default=15.0,
         ge=0.0,
         le=50.0,
-        description="Buffer in basis points above entry price when setting Breakeven Stop Loss"
+        description="Buffer in basis points above entry price when setting Breakeven Stop Loss (covers round-trip fees + slippage)"
     )
     stagnant_exit_mins: int = Field(
         default=45,
@@ -242,10 +248,30 @@ class ExecutionConfig(BaseModel):
         description="Maximum adverse funding rate (0.03%) before suppressing trend entries"
     )
     trade_cooldown_mins: int = Field(
-        default=3,
+        default=12,
         ge=0,
-        le=60,
+        le=120,
         description="Minimum cooldown in minutes after trade exit before re-entering same pair"
+    )
+    adx_filter: bool = Field(
+        default=True,
+        description="Enforce ADX trend strength threshold to suppress low-volatility chop"
+    )
+    adx_threshold: float = Field(
+        default=20.0,
+        ge=10.0,
+        le=50.0,
+        description="Minimum ADX required for trend scalping signals"
+    )
+    volume_confirmation: bool = Field(
+        default=True,
+        description="Require candle volume >= multiplier * 20-period volume SMA"
+    )
+    volume_multiplier: float = Field(
+        default=1.1,
+        ge=0.8,
+        le=3.0,
+        description="Volume multiplier relative to SMA(20) required for breakout entries"
     )
     slippage_tolerance_bps: float = Field(
         default=5.0,

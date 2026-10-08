@@ -174,11 +174,12 @@ class QuantitativeBacktester:
         if len(bars) < 100:
             raise ValueError(f"Need at least 100 bars for feature warm-up, got {len(bars)}")
 
-        # Initialize fresh strategy engine
+        # Initialize fresh strategy engine with multi-timeframe structures
         strat = StrategyEngine(self.config)
         tf_1m = TimeframeSeries(symbol, "1m", max_bars=300)
         tf_5m = TimeframeSeries(symbol, "5m", max_bars=300)
-        strat.series[symbol] = {"1m": tf_1m, "5m": tf_5m}
+        tf_15m = TimeframeSeries(symbol, "15m", max_bars=300)
+        strat.series[symbol] = {"1m": tf_1m, "5m": tf_5m, "15m": tf_15m}
 
         equity = self.initial_capital
         hwm = equity
@@ -191,12 +192,32 @@ class QuantitativeBacktester:
         # Current open position simulation state
         open_pos: Optional[Dict[str, Any]] = None
 
+        def aggregate_to_tf(series: TimeframeSeries, b: Bar, interval_ms: int) -> None:
+            bucket_ts = (b.timestamp // interval_ms) * interval_ms
+            if not series.bars:
+                series.add_or_update_bar(Bar(timestamp=bucket_ts, open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume, turnover=b.turnover))
+                return
+            last = series.bars[-1]
+            if last.timestamp == bucket_ts:
+                updated = Bar(
+                    timestamp=bucket_ts,
+                    open=last.open,
+                    high=max(last.high, b.high),
+                    low=min(last.low, b.low),
+                    close=b.close,
+                    volume=last.volume + b.volume,
+                    turnover=last.turnover + b.turnover,
+                )
+                series.bars[-1] = updated
+            else:
+                series.add_or_update_bar(Bar(timestamp=bucket_ts, open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume, turnover=b.turnover))
+
         # Warm up technical indicators with first 60 bars
         warmup_bars = min(60, len(bars) // 4)
         for b in bars[:warmup_bars]:
             tf_1m.add_or_update_bar(b)
-            # Synthesize 5m bars
-            tf_5m.add_or_update_bar(b)
+            aggregate_to_tf(tf_5m, b, 300_000)
+            aggregate_to_tf(tf_15m, b, 900_000)
 
         # Simulation loop
         cooldown_until_ts = 0
@@ -204,7 +225,8 @@ class QuantitativeBacktester:
         for i in range(warmup_bars, len(bars)):
             bar = bars[i]
             tf_1m.add_or_update_bar(bar)
-            tf_5m.add_or_update_bar(bar)
+            aggregate_to_tf(tf_5m, bar, 300_000)
+            aggregate_to_tf(tf_15m, bar, 900_000)
 
             # Update drawdown tracking
             if equity > hwm:
