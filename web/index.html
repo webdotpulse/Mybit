@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bybit V5 Autonomous Engine — Admin Executive Dashboard</title>
+  <meta name="description" content="Production-Grade Autonomous Crypto Micro-Scalping & Trend Engine for Bybit V5 Unified Trading Account">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Top Navigation Bar -->
+  <header class="navbar">
+    <div class="brand">
+      <div class="brand-icon">⚡</div>
+      <div>
+        <div style="display: flex; align-items: center; gap: 0.6rem;">
+          <h1 class="brand-title">BYBIT V5 AUTONOMOUS ENGINE</h1>
+          <span class="brand-tag">UTA Linear</span>
+          <span class="brand-tag" id="env-tag" style="background: rgba(138, 43, 226, 0.15); color: #d094ff; border-color: rgba(138, 43, 226, 0.4);">TESTNET</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="nav-metrics">
+      <div class="status-badge" id="engine-status-badge">
+        <span class="pulse-dot"></span>
+        <span id="engine-status-text">AUTONOMOUS RUNNING</span>
+      </div>
+      <a href="setup.html" style="color: var(--text-secondary); text-decoration: none; font-size: 0.85rem; font-weight: 600; padding: 0.5rem 0.8rem; border-radius: 6px; border: 1px solid var(--border-subtle);">⚙️ Configuration</a>
+      <button class="btn-panic" id="btn-panic" onclick="triggerPanic()">
+        <span>🛑</span>
+        <span>PANIC STOP</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Dashboard View -->
+  <main class="dashboard-container">
+    
+    <!-- Top KPI Grid -->
+    <section class="kpi-grid">
+      <div class="card">
+        <div class="kpi-title">
+          <span>Account Equity</span>
+          <span>💼</span>
+        </div>
+        <div class="kpi-value" id="kpi-equity">$1,000.00</div>
+        <div class="kpi-sub">
+          <span>HWM:</span>
+          <span id="kpi-hwm" style="color: #fff;">$1,000.00</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="kpi-title">
+          <span>Daily Drawdown</span>
+          <span>📉</span>
+        </div>
+        <div class="kpi-value positive" id="kpi-drawdown">0.00%</div>
+        <div class="kpi-sub">
+          <span>Circuit Breaker:</span>
+          <span class="negative">2.50% Max</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="kpi-title">
+          <span>Win Rate / Realized PnL</span>
+          <span>🎯</span>
+        </div>
+        <div class="kpi-value positive" id="kpi-pnl">+$0.00</div>
+        <div class="kpi-sub">
+          <span id="kpi-winrate">0.0% Win Rate</span>
+          <span>•</span>
+          <span id="kpi-trades">0 Trades</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="kpi-title">
+          <span>Dynamic Half-Kelly Sizing</span>
+          <span>📐</span>
+        </div>
+        <div class="kpi-value neutral" id="kpi-kelly">1.00%</div>
+        <div class="kpi-sub">
+          <span>Risk Band: 0.5% – 1.5%</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main 2-Column Section -->
+    <div class="main-grid">
+      
+      <!-- Left Column: Active Positions & Automated Trade Decisions -->
+      <div style="display: flex; flex-direction: column; gap: 1.5rem;">
+        
+        <!-- Live Market Regime Status -->
+        <div class="regime-banner" id="regime-banner">
+          <div class="regime-info">
+            <div class="regime-indicator" id="regime-indicator"></div>
+            <div class="regime-text">
+              <h4 id="regime-name">REGIME: BULL_TREND DETECTED</h4>
+              <p id="regime-desc">EMA ribbon (9 > 21 > 50) aligned. Positive Order Flow Imbalance (OFI). Trend scalping active.</p>
+            </div>
+          </div>
+          <div class="regime-pill" id="regime-pill">CONFIDENCE: 85%</div>
+        </div>
+
+        <!-- Active Positions Card -->
+        <div class="card">
+          <div class="section-header">
+            <h2 class="section-title">
+              <span>📊 Active Scalping Positions</span>
+              <span class="brand-tag" id="pos-count-tag">0 Active</span>
+            </h2>
+            <div style="font-size: 0.75rem; color: var(--text-muted); font-family: var(--font-mono);">
+              Reconciled: <span id="last-recon-time">Just now (10s sync)</span>
+            </div>
+          </div>
+
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Size</th>
+                  <th>Entry Price</th>
+                  <th>Mark Price</th>
+                  <th>Unrealized PnL</th>
+                  <th>TP Bracket</th>
+                  <th>SL Bracket</th>
+                  <th>Leverage</th>
+                </tr>
+              </thead>
+              <tbody id="positions-tbody">
+                <tr>
+                  <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                    No active positions currently open. Engine scanning multi-timeframe feeds.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Automated Execution & Decision Feed -->
+        <div class="card">
+          <div class="section-header">
+            <h2 class="section-title">
+              <span>🤖 Autonomous Decision & Execution Stream</span>
+            </h2>
+            <span class="brand-tag">Maker-First Mode</span>
+          </div>
+
+          <div class="feed-container" id="feed-container">
+            <div class="feed-item">
+              <div class="feed-time">19:35:10</div>
+              <div class="feed-content">
+                <div class="feed-headline">⚡ Engine Initialized & Indicators Primed</div>
+                <div class="feed-detail">Multi-timeframe series loaded (1m, 5m, 15m) for BTCUSDT, ETHUSDT, SOLUSDT. WebSocket streams connected.</div>
+              </div>
+            </div>
+            <div class="feed-item">
+              <div class="feed-time">19:35:11</div>
+              <div class="feed-content">
+                <div class="feed-headline">🔍 Regime Classifier Scan Complete</div>
+                <div class="feed-detail">BTCUSDT: BULL_TREND (EMA9 > EMA21 > EMA50, OFI: +2.4). Maker Post-Only bracket order calculated.</div>
+              </div>
+            </div>
+            <div class="feed-item" style="border-left-color: var(--accent-emerald);">
+              <div class="feed-time">19:35:12</div>
+              <div class="feed-content">
+                <div class="feed-headline">🟢 Autonomous Limit Order Placed: Buy 0.05 BTCUSDT</div>
+                <div class="feed-detail">Price: $64,250.00 | Native TP: $64,550.00 (1.2× ATR) | SL: $64,050.00 (0.8× ATR) | TimeInForce: PostOnly</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Right Column: Circuit Breakers, Tuning & Latency -->
+      <div style="display: flex; flex-direction: column; gap: 1.5rem;">
+        
+        <!-- Circuit Breakers Protection Card -->
+        <div class="card">
+          <div class="section-header">
+            <h2 class="section-title">
+              <span>🛡️ Capital Protection & Failsafes</span>
+            </h2>
+          </div>
+
+          <div class="cb-list">
+            <div class="cb-item">
+              <div>
+                <div class="cb-name">Daily Max Drawdown (2.5%)</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);">Current: 0.00%</div>
+              </div>
+              <span class="cb-badge cb-active" id="cb-dd-badge">ACTIVE / OK</span>
+            </div>
+
+            <div class="cb-item">
+              <div>
+                <div class="cb-name">Consecutive Loss Cutoff</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);" id="cb-loss-count">0 / 4 Losses (30m cooldown)</div>
+              </div>
+              <span class="cb-badge cb-active" id="cb-loss-badge">ACTIVE / OK</span>
+            </div>
+
+            <div class="cb-item">
+              <div>
+                <div class="cb-name">3-Sigma Volatility Spike</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);">Threshold: > 3.0 Std Dev</div>
+              </div>
+              <span class="cb-badge cb-active" id="cb-vol-badge">NORMAL</span>
+            </div>
+
+            <div class="cb-item">
+              <div>
+                <div class="cb-name">Chop Suppressor</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);">Rejects low-vol mean-reverting churn</div>
+              </div>
+              <span class="cb-badge cb-active">FILTER ON</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Infrastructure & Latency Card -->
+        <div class="card">
+          <div class="section-header">
+            <h2 class="section-title">
+              <span>🌐 Infrastructure & Low-Latency</span>
+            </h2>
+          </div>
+          
+          <div style="display: flex; flex-direction: column; gap: 0.75rem; font-size: 0.8rem; font-family: var(--font-mono);">
+            <div style="display: flex; justify-content: space-between; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border-subtle);">
+              <span style="color: var(--text-secondary);">Target Cloud:</span>
+              <span style="color: #fff;">GCP Singapore (asia-southeast1)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border-subtle);">
+              <span style="color: var(--text-secondary);">Bybit Engine Target:</span>
+              <span style="color: #fff;">AWS Singapore (ap-southeast-1)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border-subtle);">
+              <span style="color: var(--text-secondary);">Interconnect Latency:</span>
+              <span style="color: var(--accent-emerald); font-weight: 700;">~5.2 ms (Sub-10ms)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border-subtle);">
+              <span style="color: var(--text-secondary);">WebSocket Protocol:</span>
+              <span style="color: var(--accent-cyan);">WSS V5 (Keepalive: 20s)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-secondary);">IP Whitelist Binding:</span>
+              <span style="color: var(--accent-emerald);">Bound (Static IPv4)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Self-Adaptive Learning Parameters -->
+        <div class="card">
+          <div class="section-header">
+            <h2 class="section-title">
+              <span>🧠 Self-Adaptive Tuning</span>
+            </h2>
+            <span class="brand-tag">Every 20 Trades</span>
+          </div>
+
+          <div style="display: flex; flex-direction: column; gap: 0.6rem; font-size: 0.8rem; font-family: var(--font-mono);">
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-secondary);">Take Profit Multiplier:</span>
+              <span id="param-tp" style="color: var(--accent-emerald);">1.20 × ATR</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-secondary);">Stop Loss Multiplier:</span>
+              <span id="param-sl" style="color: var(--accent-rose);">0.80 × ATR</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-secondary);">Kelly Scaling Factor:</span>
+              <span id="param-kelly" style="color: var(--accent-cyan);">0.50 (Half-Kelly)</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

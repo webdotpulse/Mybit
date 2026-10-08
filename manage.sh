@@ -37,6 +37,7 @@ usage() {
     echo ""
     echo "Available Commands:"
     echo "  status   - Display live PnL, active positions, win rate, and circuit breakers"
+    echo "  web      - Launch the Web Admin Executive Dashboard & Installer (port 8080)"
     echo "  logs     - Stream live real-time engine execution logs"
     echo "  panic    - EMERGENCY: Cancel all open orders and market close all positions"
     echo "  update   - Pull latest git updates, sync virtualenv, and restart daemon"
@@ -55,6 +56,15 @@ case "$COMMAND" in
             exit 1
         fi
         $PYTHON manage_cli.py status
+        ;;
+
+    web)
+        if [ ! -f "$PYTHON" ]; then
+            echo -e "${RED}Error: Virtual environment not found. Run ./install.sh first.${RESET}"
+            exit 1
+        fi
+        echo -e "${GREEN}Starting Bybit V5 Web Executive Dashboard on http://127.0.0.1:8080...${RESET}"
+        $PYTHON web_server.py
         ;;
 
     logs)
