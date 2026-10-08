@@ -443,4 +443,40 @@ def test_trading_engine_wallet_equity_resilience():
     asyncio.run(_test())
 
 
+def test_micro_bootstrap_bybit_lot_and_notional_compliance():
+    """Validates that micro-account sizing satisfies Bybit 5 USDT min notional and lot steps."""
+    from main import TradingEngine
+    from config import get_tier_for_equity, CapitalTier
+
+    tier, tier_cfg = get_tier_for_equity(40.36)
+    assert tier == CapitalTier.MICRO_BOOTSTRAP
+    assert tier_cfg["max_open_positions"] == 1
+    assert "DOGEUSDT" in tier_cfg["symbols"]
+    assert "SUIUSDT" in tier_cfg["symbols"]
+
+    config = AppConfig()
+    creds = BybitCredentials(api_key="AK_TEST_KEY_1234", api_secret="AS_TEST_SECRET_5678", testnet=True)
+    engine = TradingEngine(config, creds)
+    engine.risk_manager.current_equity = 40.36
+
+    # Test SUI lot step formatting (must be step of 10)
+    sui_qty_small = engine._format_qty("SUIUSDT", 2.9)
+    assert sui_qty_small == 10.0  # Must round up to minOrderQty 10!
+    sui_qty_large = engine._format_qty("SUIUSDT", 23.4)
+    assert sui_qty_large == 20.0
+
+    # Test DOGE lot step formatting (must be integer, min 1)
+    doge_qty = engine._format_qty("DOGEUSDT", 67.2)
+    assert doge_qty == 67.0
+
+    # Test SOL lot step formatting (must be at least 0.1)
+    sol_qty = engine._format_qty("SOLUSDT", 0.04)
+    assert sol_qty == 0.1
+
+    # Test that risk manager permits exchange minimum notional size
+    permitted, reason = engine.risk_manager.is_order_permitted("SUIUSDT", 10.30)
+    assert permitted, f"Expected permitted but got: {reason}"
+
+
+
 

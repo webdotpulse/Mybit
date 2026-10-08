@@ -365,19 +365,30 @@ class TradingEngine:
         leverage = self.config.risk.default_leverage
         notional = capital_pool * kelly_pct * leverage
 
-        # Permission check with risk manager
-        permitted, reason = self.risk_manager.is_order_permitted(sig.symbol, notional)
-        if not permitted:
-            logger.debug(f"[{sig.symbol}] Order rejected by RiskManager: {reason}")
-            return
+        # Ensure notional meets Bybit minimum order floor (5.00 USDT hard floor)
+        MIN_NOTIONAL = 5.50
+        if notional < MIN_NOTIONAL:
+            notional = MIN_NOTIONAL
 
         qty = self._format_qty(sig.symbol, notional / sig.price)
         if qty <= 0:
             return
 
+        # Ensure actual formatted value satisfies Bybit min notional
+        actual_notional = qty * sig.price
+        if actual_notional < 5.0:
+            qty = self._format_qty(sig.symbol, 5.5 / sig.price)
+            actual_notional = qty * sig.price
+
+        # Permission check with risk manager using actual formatted notional
+        permitted, reason = self.risk_manager.is_order_permitted(sig.symbol, actual_notional)
+        if not permitted:
+            logger.debug(f"[{sig.symbol}] Order rejected by RiskManager: {reason}")
+            return
+
         logger.info(
             f"⚡ Signal on {sig.symbol}: {sig.side} {qty} @ ${sig.price} "
-            f"(Regime: {sig.regime.value}, TIF: {sig.time_in_force})"
+            f"(Regime: {sig.regime.value}, TIF: {sig.time_in_force}, Notional: ${actual_notional:.2f})"
         )
 
         # 2. Maker-First Order Submission
@@ -393,12 +404,14 @@ class TradingEngine:
         )
 
         ret_code = res.get("retCode", -1)
+        ret_msg = res.get("retMsg", "Unknown")
+
         # RetCode 110007 = PostOnly will take liquidity
         if ret_code == 110007 and self.config.execution.maker_first:
             logger.debug(f"[{sig.symbol}] PostOnly crossed spread. Retrying with adjusted tick...")
             # If high conviction breakout, execute IOC limit
             if sig.conviction >= 0.85:
-                await self.client.create_order(
+                ioc_res = await self.client.create_order(
                     symbol=sig.symbol,
                     side=sig.side,
                     order_type="Limit",
@@ -408,6 +421,16 @@ class TradingEngine:
                     take_profit=sig.tp_price,
                     stop_loss=sig.sl_price,
                 )
+                if ioc_res.get("retCode") == 0:
+                    order_id = (ioc_res.get("result") or {}).get("orderId", "")
+                    self._pending_orders[order_id] = {
+                        "symbol": sig.symbol,
+                        "side": sig.side,
+                        "qty": qty,
+                        "price": sig.price,
+                        "placed_at": time.time(),
+                    }
+                    logger.info(f"⚡ [{sig.symbol}] High-conviction IOC taker order filled. OrderID: {order_id}")
         elif ret_code == 0:
             order_id = (res.get("result") or {}).get("orderId", "")
             self._pending_orders[order_id] = {
@@ -417,6 +440,10 @@ class TradingEngine:
                 "price": sig.price,
                 "placed_at": time.time(),
             }
+            logger.info(
+                f"✅ [{sig.symbol}] Maker PostOnly order placed on book! OrderID: {order_id} "
+                f"({sig.side} {qty} @ ${sig.price}, Notional: ${actual_notional:.2f})"
+            )
             await self.telegram.send_trade_entry(
                 symbol=sig.symbol,
                 side=sig.side,
@@ -426,18 +453,29 @@ class TradingEngine:
                 sl=sig.sl_price,
                 regime=sig.regime.value,
             )
+        else:
+            logger.warning(
+                f"❌ [{sig.symbol}] Order rejected by Bybit (retCode {ret_code}): {ret_msg} "
+                f"| Attempted: {sig.side} {qty} @ ${sig.price} (Notional: ${actual_notional:.2f})"
+            )
 
     def _format_qty(self, symbol: str, raw_qty: float) -> float:
         """Rounds quantity to symbol lot size precision on Bybit V5."""
         sym = symbol.upper()
         if "BTC" in sym:
-            return round(raw_qty, 3)
+            return max(0.001, round(raw_qty, 3))
         elif "ETH" in sym:
-            return round(raw_qty, 2)
-        elif "SOL" in sym or "SUI" in sym or "AVAX" in sym or "LINK" in sym:
-            return round(raw_qty, 1)
-        elif "DOGE" in sym or "XRP" in sym or "ADA" in sym or "TRX" in sym:
-            return float(int(raw_qty))
+            return max(0.01, round(raw_qty, 2))
+        elif "SOL" in sym or "AVAX" in sym or "LINK" in sym:
+            return max(0.1, round(raw_qty, 1))
+        elif "SUI" in sym:
+            # Bybit SUIUSDT linear contract: minOrderQty = 10, qtyStep = 10
+            steps = max(1, int(round(raw_qty / 10.0)))
+            return float(steps * 10)
+        elif "DOGE" in sym or "ADA" in sym or "TRX" in sym:
+            return float(max(1, int(round(raw_qty))))
+        elif "XRP" in sym:
+            return max(0.1, round(raw_qty, 1))
         return round(raw_qty, 2)
 
     async def _reconciliation_loop(self) -> None:

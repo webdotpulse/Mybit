@@ -52,11 +52,11 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
         return (
             CapitalTier.MICRO_BOOTSTRAP,
             {
-                "symbols": ["SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+                "symbols": ["DOGEUSDT", "SUIUSDT", "SOLUSDT"],
                 "max_open_positions": 1,
                 "max_daily_risk_pct": 5.0,  # 5% gives breathing room on micro accounts
-                "min_position_equity_pct": 1.0,
-                "max_position_equity_pct": 2.0,
+                "min_position_equity_pct": 2.5,
+                "max_position_equity_pct": 6.0,
                 "default_leverage": 5,
                 "auto_tuning_interval": 15,
                 "description": "Micro/Bootstrap Tier ($10 - $99). Low-notional altcoins, max 1 position, 5% daily risk."

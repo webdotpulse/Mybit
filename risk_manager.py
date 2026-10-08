@@ -168,8 +168,12 @@ class RiskManager:
 
         # Position size cap against allocated capital
         max_notional = self.current_equity * (self.risk_cfg.max_position_equity_pct / 100.0) * self.risk_cfg.default_leverage
-        if notional_value > max_notional * 1.05:  # small 5% buffer
-            return False, f"Order notional ${notional_value:.2f} exceeds risk cap ${max_notional:.2f}."
+        # Allow at least Bybit exchange minimum threshold (e.g. $16 for SOL 0.1, $11 for SUI 10, $6 for DOGE)
+        # provided margin requirement does not exceed 25% of total equity
+        exchange_min_notional = min(16.0, self.current_equity * self.risk_cfg.default_leverage * 0.25)
+        effective_cap = max(max_notional, exchange_min_notional)
+        if notional_value > effective_cap * 1.05:  # small 5% buffer
+            return False, f"Order notional ${notional_value:.2f} exceeds risk cap ${effective_cap:.2f}."
 
         return True, "Permitted"
 
