@@ -185,6 +185,30 @@ WantedBy=multi-user.target
     local_service.write_text(service_content)
     console.print(f"[green]✓ Generated local service unit: {local_service}[/green]")
 
+    web_service_content = f"""[Unit]
+Description=Bybit V5 Autonomous Engine - Live Executive Web Dashboard (View-Only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+WorkingDirectory={base_dir}
+ExecStart={venv_python} {base_dir}/web_server.py --port 8088 --public --read-only
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
+"""
+    local_web_service = base_dir / "bybit-web.service"
+    local_web_service.write_text(web_service_content)
+    console.print(f"[green]✓ Generated local web service unit: {local_web_service}[/green]")
+
     is_root = os.geteuid() == 0
     can_sudo = False
     try:
@@ -194,24 +218,33 @@ WantedBy=multi-user.target
         can_sudo = False
 
     if is_root:
-        target_path = Path("/etc/systemd/system/bybit-engine.service")
-        target_path.write_text(service_content)
+        Path("/etc/systemd/system/bybit-engine.service").write_text(service_content)
+        Path("/etc/systemd/system/bybit-web.service").write_text(web_service_content)
         subprocess.run(["systemctl", "daemon-reload"], check=False)
-        console.print("[green]✓ Installed service to /etc/systemd/system/bybit-engine.service[/green]")
+        subprocess.run(["systemctl", "enable", "--now", "bybit-web.service"], check=False)
+        console.print("[green]✓ Installed and started services in /etc/systemd/system/[/green]")
     elif can_sudo:
         subprocess.run(["sudo", "cp", str(local_service), "/etc/systemd/system/bybit-engine.service"], check=False)
+        subprocess.run(["sudo", "cp", str(local_web_service), "/etc/systemd/system/bybit-web.service"], check=False)
         subprocess.run(["sudo", "systemctl", "daemon-reload"], check=False)
-        console.print("[green]✓ Installed service to /etc/systemd/system/bybit-engine.service (via sudo)[/green]")
+        subprocess.run(["sudo", "systemctl", "enable", "--now", "bybit-web.service"], check=False)
+        console.print("[green]✓ Installed and started services in /etc/systemd/system/ (via sudo)[/green]")
     else:
         # Install as user systemd service
         user_systemd_dir = Path.home() / ".config" / "systemd" / "user"
         user_systemd_dir.mkdir(parents=True, exist_ok=True)
         user_service = user_systemd_dir / "bybit-engine.service"
-        # User unit does not need User= parameter
         user_service_content = service_content.replace(f"User={user}\n", "")
         user_service.write_text(user_service_content)
+
+        user_web_service = user_systemd_dir / "bybit-web.service"
+        user_web_content = web_service_content.replace(f"User={user}\n", "")
+        user_web_service.write_text(user_web_content)
+
+        subprocess.run(["loginctl", "enable-linger", user], check=False)
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-        console.print(f"[green]✓ Installed user service: {user_service}[/green]")
+        subprocess.run(["systemctl", "--user", "enable", "--now", "bybit-web.service"], check=False)
+        console.print(f"[green]✓ Installed and started user services in: {user_systemd_dir}[/green]")
 
 
 def main() -> None:

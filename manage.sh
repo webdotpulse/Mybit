@@ -31,20 +31,117 @@ elif [ "$EUID" -ne 0 ]; then
     fi
 fi
 
+get_web_systemctl() {
+    if [ -f "/etc/systemd/system/bybit-web.service" ]; then
+        if [ "$EUID" -eq 0 ]; then
+            echo "systemctl"
+        elif sudo -n true 2>/dev/null; then
+            echo "sudo systemctl"
+        else
+            echo "systemctl"
+        fi
+    else
+        echo "systemctl --user"
+    fi
+}
+
+install_web_service() {
+    echo -e "${YELLOW}Provisioning bybit-web.service daemon on this machine...${RESET}"
+    IS_ROOT=false
+    CAN_SUDO=false
+    if [ "$EUID" -eq 0 ]; then
+        IS_ROOT=true
+    elif sudo -n true 2>/dev/null; then
+        CAN_SUDO=true
+    fi
+
+    CURRENT_USER="$(whoami)"
+
+    if [ "$IS_ROOT" = true ] || [ "$CAN_SUDO" = true ]; then
+        SERVICE_FILE="/tmp/bybit-web.service"
+        cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=Bybit V5 Autonomous Engine - Live Executive Web Dashboard (View-Only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$CURRENT_USER
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=$SCRIPT_DIR/$PYTHON $SCRIPT_DIR/web_server.py --port 8088 --public --read-only
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        if [ "$IS_ROOT" = true ]; then
+            cp "$SERVICE_FILE" /etc/systemd/system/bybit-web.service
+            systemctl daemon-reload
+            systemctl enable --now bybit-web.service
+        else
+            sudo cp "$SERVICE_FILE" /etc/systemd/system/bybit-web.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now bybit-web.service
+        fi
+        rm -f "$SERVICE_FILE"
+        echo -e "${GREEN}✓ Installed and started system service at /etc/systemd/system/bybit-web.service${RESET}"
+    else
+        USER_SERVICE_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$USER_SERVICE_DIR"
+        loginctl enable-linger "$CURRENT_USER" 2>/dev/null || true
+        cat <<EOF > "$USER_SERVICE_DIR/bybit-web.service"
+[Unit]
+Description=Bybit V5 Autonomous Engine - Live Executive Web Dashboard (View-Only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=$SCRIPT_DIR/$PYTHON $SCRIPT_DIR/web_server.py --port 8088 --public --read-only
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=default.target
+EOF
+        systemctl --user daemon-reload
+        systemctl --user enable --now bybit-web.service
+        echo -e "${GREEN}✓ Installed and started user service at $USER_SERVICE_DIR/bybit-web.service${RESET}"
+    fi
+}
+
+ensure_web_service_installed() {
+    if [ ! -f "/etc/systemd/system/bybit-web.service" ] && [ ! -f "$HOME/.config/systemd/user/bybit-web.service" ]; then
+        install_web_service
+    fi
+}
+
 usage() {
     echo -e "${CYAN}${BOLD}Bybit V5 Autonomous Engine - Control Utility${RESET}"
     echo "Usage: ./manage.sh [command]"
     echo ""
     echo "Available Commands:"
-    echo "  status   - Display live PnL, active positions, win rate, and circuit breakers"
-    echo "  verify   - Deep diagnostic test of Bybit API keys, IP whitelist & connectivity"
-    echo "  mainnet  - Switch environment to Live Mainnet (api.bybit.com)"
-    echo "  testnet  - Switch environment to Testnet (api-testnet.bybit.com)"
+    echo "  status      - Display live PnL, active positions, win rate, and circuit breakers"
+    echo "  verify      - Deep diagnostic test of Bybit API keys, IP whitelist & connectivity"
+    echo "  mainnet     - Switch environment to Live Mainnet (api.bybit.com)"
+    echo "  testnet     - Switch environment to Testnet (api-testnet.bybit.com)"
     echo "  web         - Launch Web Dashboard in foreground (e.g. ./manage.sh web --public)"
     echo "  web-start   - Start 24/7 background Web Dashboard systemd daemon"
     echo "  web-stop    - Stop 24/7 background Web Dashboard systemd daemon"
     echo "  web-restart - Restart 24/7 background Web Dashboard systemd daemon"
     echo "  web-status  - View status of 24/7 background Web Dashboard service"
+    echo "  web-install - Install/reinstall 24/7 background Web Dashboard service"
     echo "  backtest    - Run quantitative backtest simulation on historical Bybit data"
     echo "  logs        - Stream live real-time engine execution logs"
     echo "  panic       - EMERGENCY: Cancel all open orders and market close all positions"
@@ -119,25 +216,36 @@ case "$COMMAND" in
         ;;
 
     web-start)
+        ensure_web_service_installed
+        W_CMD="$(get_web_systemctl)"
         echo -e "${GREEN}Starting 24/7 bybit-web background service...${RESET}"
-        systemctl --user start bybit-web
+        $W_CMD start bybit-web
         echo -e "${GREEN}✓ Started.${RESET}"
         ;;
 
     web-stop)
+        W_CMD="$(get_web_systemctl)"
         echo -e "${YELLOW}Stopping 24/7 bybit-web background service...${RESET}"
-        systemctl --user stop bybit-web
+        $W_CMD stop bybit-web || true
         echo -e "${YELLOW}✓ Stopped.${RESET}"
         ;;
 
     web-restart)
+        ensure_web_service_installed
+        W_CMD="$(get_web_systemctl)"
         echo -e "${YELLOW}Restarting 24/7 bybit-web background service...${RESET}"
-        systemctl --user restart bybit-web
+        $W_CMD restart bybit-web
         echo -e "${GREEN}✓ Restarted.${RESET}"
         ;;
 
     web-status)
-        systemctl --user status bybit-web --no-pager || true
+        ensure_web_service_installed
+        W_CMD="$(get_web_systemctl)"
+        $W_CMD status bybit-web --no-pager || true
+        ;;
+
+    web-install)
+        install_web_service
         ;;
 
     backtest|sim|simulate)
