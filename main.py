@@ -28,7 +28,7 @@ from config import (
     load_credentials,
     save_config,
 )
-from risk_manager import Position, RiskManager
+from risk_manager import Position, RiskManager, _to_float, _to_int
 from strategy import MarketRegime, Signal, StrategyEngine, TimeframeSeries
 from telegram_notifier import TelegramNotifier
 from trade_journal import ParameterAutoTuner, TradeJournal, TradeRecord
@@ -64,6 +64,7 @@ class TradingEngine:
         self._running = False
         self._background_tasks: list[asyncio.Task] = []
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
+        self._last_pos_heartbeat: float = 0.0
         self.status_file = self.config.data_dir / "engine_status.json"
 
     async def apply_capital_tier(self, total_equity: float, force: bool = False) -> None:
@@ -207,6 +208,7 @@ class TradingEngine:
         self.client.execution_callbacks.append(self._on_execution_update)
         self.client.order_callbacks.append(self._on_order_update)
         self.client.wallet_callbacks.append(self._on_wallet_update)
+        self.client.position_callbacks.append(self._on_position_update)
 
         # 5. Perform initial state reconciliation
         await self.risk_manager.reconcile()
@@ -308,6 +310,11 @@ class TradingEngine:
                     await self.telegram.send_message(
                         f"⚙️ *Self-Adaptive Tuning Activated*\n{tuning_res['rationale']}"
                     )
+            elif exec_qty > 0:
+                logger.info(
+                    f"🎉 [FILLED] {symbol} {side} {exec_qty} filled @ ${exec_price:.4f} "
+                    f"({'Maker Rebate' if is_maker else 'Taker'})"
+                )
         except Exception as e:
             logger.error(f"Error handling execution update: {e}")
 
@@ -315,8 +322,33 @@ class TradingEngine:
         """Updates internal order tracking."""
         status = order_data.get("orderStatus")
         order_id = order_data.get("orderId")
-        if status in ("Filled", "Cancelled", "Rejected") and order_id in self._pending_orders:
+        if status in ("Filled", "Cancelled", "Rejected", "Deactivated") and order_id in self._pending_orders:
             self._pending_orders.pop(order_id, None)
+
+    async def _on_position_update(self, pos_data: Dict[str, Any]) -> None:
+        """Updates in-memory positions instantly via WebSocket stream."""
+        try:
+            size = _to_float(pos_data.get("size"))
+            symbol = pos_data.get("symbol", "")
+            if not symbol:
+                return
+            if size > 0:
+                self.risk_manager.positions[symbol] = Position(
+                    symbol=symbol,
+                    side=pos_data.get("side", ""),
+                    size=size,
+                    entry_price=_to_float(pos_data.get("entryPrice") or pos_data.get("avgPrice")),
+                    mark_price=_to_float(pos_data.get("markPrice")),
+                    unrealised_pnl=_to_float(pos_data.get("unrealisedPnl")),
+                    leverage=_to_int(pos_data.get("leverage"), 1),
+                    take_profit=_to_float(pos_data.get("takeProfit")) or None,
+                    stop_loss=_to_float(pos_data.get("stopLoss")) or None,
+                    trailing_stop=_to_float(pos_data.get("trailingStop")) or None,
+                )
+            else:
+                self.risk_manager.positions.pop(symbol, None)
+        except Exception as e:
+            logger.debug(f"Position stream parse error: {e}")
 
     async def _on_wallet_update(self, wallet_data: Dict[str, Any]) -> None:
         """Updates equity in real-time from WebSocket wallet stream and auto-adapts tier."""
@@ -336,7 +368,35 @@ class TradingEngine:
         """
         while self._running:
             try:
+                now = time.time()
+                total_active = len(self.risk_manager.positions) + len(self._pending_orders)
+
+                # Periodic heartbeat while holding positions or pending orders (every 15s)
+                if total_active > 0 and (now - self._last_pos_heartbeat > 15):
+                    self._last_pos_heartbeat = now
+                    for sym, pos in self.risk_manager.positions.items():
+                        pnl_sign = "+" if pos.unrealised_pnl >= 0 else ""
+                        logger.info(
+                            f"🛡️ [HOLDING POSITION] {pos.symbol} {pos.side} {pos.size} @ ${pos.entry_price:.4f} "
+                            f"| Mark: ${pos.mark_price:.4f} | uPnL: {pnl_sign}${pos.unrealised_pnl:.2f} "
+                            f"| TP: {pos.take_profit or 'Bracket'} | SL: {pos.stop_loss or 'Bracket'}"
+                        )
+                    for oid, po in self._pending_orders.items():
+                        logger.info(
+                            f"⏳ [PENDING ORDER] {po['symbol']} {po['side']} {po['qty']} @ ${po['price']} "
+                            f"(Awaiting fill on Bybit book)"
+                        )
+
+                # If at maximum position capacity, do not submit any new orders
+                if total_active >= self.config.risk.max_open_positions:
+                    await asyncio.sleep(1.0)
+                    continue
+
                 for symbol in self.config.strategy.symbols:
+                    # Enforce strict capacity limit per tick
+                    if (len(self.risk_manager.positions) + len(self._pending_orders)) >= self.config.risk.max_open_positions:
+                        break
+
                     ob = self.client.orderbooks.get(symbol)
                     if not ob:
                         continue
