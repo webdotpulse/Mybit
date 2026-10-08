@@ -1,0 +1,18 @@
+[Unit]
+Description=Bybit V5 Autonomous Engine - Live Executive Web Dashboard (View-Only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/koen/Git/Mybit
+ExecStart=/home/koen/Git/Mybit/.venv/bin/python3 /home/koen/Git/Mybit/web_server.py --port 8088 --public --read-only
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=default.target

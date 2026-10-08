@@ -127,6 +127,22 @@ function renderDashboard() {
     }
   }
 
+  // View-Only Lockdown: Hide configuration and panic stop controls
+  const isReadOnly = Boolean(engineData.read_only);
+  const panicBtn = document.getElementById('btn-panic');
+  const configLink = document.getElementById('nav-config-link');
+  const viewOnlyBadge = document.getElementById('view-only-badge');
+
+  if (isReadOnly) {
+    if (panicBtn) panicBtn.style.display = 'none';
+    if (configLink) configLink.style.display = 'none';
+    if (viewOnlyBadge) viewOnlyBadge.style.display = 'inline-flex';
+  } else {
+    if (panicBtn) panicBtn.style.display = '';
+    if (configLink) configLink.style.display = '';
+    if (viewOnlyBadge) viewOnlyBadge.style.display = 'none';
+  }
+
   document.getElementById('kpi-equity').innerText = `$${engineData.equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
   document.getElementById('kpi-hwm').innerText = `$${engineData.high_water_mark.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
   
@@ -215,6 +231,11 @@ function renderDashboard() {
 }
 
 async function triggerPanic() {
+  if (engineData.read_only) {
+    showToast("⚠️ Actions disabled: Web dashboard is operating in VIEW-ONLY mode.", false);
+    return;
+  }
+
   if (!confirm("⚠️ ARE YOU SURE? This will immediately cancel ALL open orders and submit MARKET orders to close all positions.")) {
     return;
   }

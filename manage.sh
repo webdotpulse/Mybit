@@ -40,14 +40,18 @@ usage() {
     echo "  verify   - Deep diagnostic test of Bybit API keys, IP whitelist & connectivity"
     echo "  mainnet  - Switch environment to Live Mainnet (api.bybit.com)"
     echo "  testnet  - Switch environment to Testnet (api-testnet.bybit.com)"
-    echo "  web      - Launch the Web Admin Executive Dashboard & Installer (port 8080)"
-    echo "  backtest - Run quantitative backtest simulation on historical Bybit data"
-    echo "  logs     - Stream live real-time engine execution logs"
-    echo "  panic    - EMERGENCY: Cancel all open orders and market close all positions"
-    echo "  update   - Pull latest git updates, sync virtualenv, and restart daemon"
-    echo "  start    - Start background daemon"
-    echo "  stop     - Stop background daemon"
-    echo "  restart  - Cleanly restart background daemon"
+    echo "  web         - Launch Web Dashboard in foreground (e.g. ./manage.sh web --public)"
+    echo "  web-start   - Start 24/7 background Web Dashboard systemd daemon"
+    echo "  web-stop    - Stop 24/7 background Web Dashboard systemd daemon"
+    echo "  web-restart - Restart 24/7 background Web Dashboard systemd daemon"
+    echo "  web-status  - View status of 24/7 background Web Dashboard service"
+    echo "  backtest    - Run quantitative backtest simulation on historical Bybit data"
+    echo "  logs        - Stream live real-time engine execution logs"
+    echo "  panic       - EMERGENCY: Cancel all open orders and market close all positions"
+    echo "  update      - Pull latest git updates, sync virtualenv, and restart daemon"
+    echo "  start       - Start background trading engine daemon"
+    echo "  stop        - Stop background trading engine daemon"
+    echo "  restart     - Cleanly restart background trading engine daemon"
     echo ""
 }
 
@@ -91,10 +95,19 @@ case "$COMMAND" in
             echo -e "${RED}Error: Virtual environment not found. Run ./install.sh first.${RESET}"
             exit 1
         fi
-        if [ "$2" == "--public" ] || [ "$2" == "-p" ]; then
-            echo -e "${GREEN}Starting Bybit V5 Web Executive Dashboard on all interfaces (http://0.0.0.0:8080)...${RESET}"
-            echo -e "${CYAN}Access directly in your browser: ${BOLD}http://<YOUR_SERVER_IP>:8080${RESET}\n"
-            $PYTHON web_server.py --public "${@:3}"
+        shift
+        HAS_PUBLIC=false
+        for arg in "$@"; do
+            if [ "$arg" == "--public" ] || [ "$arg" == "-p" ]; then
+                HAS_PUBLIC=true
+                break
+            fi
+        done
+
+        if [ "$HAS_PUBLIC" = true ]; then
+            echo -e "${GREEN}Starting Bybit V5 Web Executive Dashboard on all interfaces (http://0.0.0.0:8080) [VIEW-ONLY]...${RESET}"
+            echo -e "${CYAN}Access directly in your browser: ${BOLD}http://<YOUR_IP>:8080${RESET}\n"
+            $PYTHON web_server.py "$@"
         else
             echo -e "${GREEN}Starting Bybit V5 Web Executive Dashboard on http://127.0.0.1:8080...${RESET}"
             echo -e "${CYAN}If running on a remote server, access via SSH tunnel from your local computer:${RESET}"
@@ -103,6 +116,28 @@ case "$COMMAND" in
             echo -e "${CYAN}Or start publicly with:${RESET} ${YELLOW}./manage.sh web --public${RESET}\n"
             $PYTHON web_server.py "$@"
         fi
+        ;;
+
+    web-start)
+        echo -e "${GREEN}Starting 24/7 bybit-web background service...${RESET}"
+        systemctl --user start bybit-web
+        echo -e "${GREEN}✓ Started.${RESET}"
+        ;;
+
+    web-stop)
+        echo -e "${YELLOW}Stopping 24/7 bybit-web background service...${RESET}"
+        systemctl --user stop bybit-web
+        echo -e "${YELLOW}✓ Stopped.${RESET}"
+        ;;
+
+    web-restart)
+        echo -e "${YELLOW}Restarting 24/7 bybit-web background service...${RESET}"
+        systemctl --user restart bybit-web
+        echo -e "${GREEN}✓ Restarted.${RESET}"
+        ;;
+
+    web-status)
+        systemctl --user status bybit-web --no-pager || true
         ;;
 
     backtest|sim|simulate)

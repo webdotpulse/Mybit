@@ -28,7 +28,11 @@
         <span class="pulse-dot"></span>
         <span id="engine-status-text">AUTONOMOUS RUNNING</span>
       </div>
-      <a href="setup.html" style="color: var(--text-secondary); text-decoration: none; font-size: 0.85rem; font-weight: 600; padding: 0.5rem 0.8rem; border-radius: 6px; border: 1px solid var(--border-subtle);">⚙️ Configuration</a>
+      <div id="view-only-badge" style="display: none; align-items: center; gap: 0.4rem; padding: 0.45rem 0.85rem; border-radius: 6px; font-size: 0.8rem; font-weight: 700; color: #a0aec0; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); letter-spacing: 0.04em;">
+        <span>🔒</span>
+        <span>VIEW ONLY</span>
+      </div>
+      <a id="nav-config-link" href="setup.html" style="color: var(--text-secondary); text-decoration: none; font-size: 0.85rem; font-weight: 600; padding: 0.5rem 0.8rem; border-radius: 6px; border: 1px solid var(--border-subtle);">⚙️ Configuration</a>
       <button class="btn-panic" id="btn-panic" onclick="triggerPanic()">
         <span>🛑</span>
         <span>PANIC STOP</span>
