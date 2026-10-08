@@ -1,0 +1,24 @@
+# Virtual Environment & Python cache
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Secrets & Credentials (Never commit)
+.engine_key
+secrets.enc
+config.json
+.env
+
+# Runtime Data & Logs
+data/
+logs/
+*.db
+*.sqlite3
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store

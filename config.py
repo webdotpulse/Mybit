@@ -1,0 +1,292 @@
+"""
+Production Configuration Module for Bybit V5 Unified Trading Account Engine.
+Validates parameters with Pydantic v2 and enforces strict security via Fernet encryption.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import stat
+from enum import Enum
+from pathlib import Path
+from typing import List, Optional
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from pydantic import BaseModel, Field, field_validator
+
+
+class TradingMode(str, Enum):
+    LINEAR = "linear"  # USDT Perpetual (Unified Trading Account)
+    SPOT = "spot"      # Spot Trading
+
+
+class BybitCredentials(BaseModel):
+    """Raw Bybit API credentials."""
+    api_key: str = Field(..., min_length=10, description="Bybit V5 API Key")
+    api_secret: str = Field(..., min_length=15, description="Bybit V5 API Secret")
+    testnet: bool = Field(default=False, description="Use Bybit Testnet environment")
+
+    @field_validator("api_key", "api_secret")
+    @classmethod
+    def strip_whitespace(cls, v: str) -> str:
+        return v.strip()
+
+
+class RiskConfig(BaseModel):
+    """Mission-Critical Risk Management and Capital Protection Limits."""
+    allocated_capital_usd: float = Field(
+        default=1000.0,
+        gt=0,
+        description="Allocated trading equity pool in USD"
+    )
+    max_daily_risk_pct: float = Field(
+        default=2.5,
+        ge=0.5,
+        le=10.0,
+        description="Daily max drawdown circuit breaker threshold (%)"
+    )
+    min_position_equity_pct: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=5.0,
+        description="Lower bound Kelly position sizing fraction (%)"
+    )
+    max_position_equity_pct: float = Field(
+        default=1.5,
+        ge=0.5,
+        le=10.0,
+        description="Upper bound Kelly position sizing fraction (%)"
+    )
+    max_consecutive_losses: int = Field(
+        default=4,
+        ge=2,
+        le=10,
+        description="Consecutive loss cutoff triggering cooldown"
+    )
+    consecutive_loss_cooldown_mins: int = Field(
+        default=30,
+        ge=5,
+        le=240,
+        description="Pause trading duration after consecutive loss cutoff (minutes)"
+    )
+    atr_spike_threshold_std: float = Field(
+        default=3.0,
+        ge=2.0,
+        le=6.0,
+        description="ATR volatility spike kill switch threshold in standard deviations"
+    )
+    default_leverage: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Default position leverage for linear perpetuals"
+    )
+    max_open_positions: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum concurrent open positions across all pairs"
+    )
+
+
+class ExecutionConfig(BaseModel):
+    """Maker-first execution and order placement rules."""
+    maker_first: bool = Field(
+        default=True,
+        description="Prioritize Post-Only limit orders to capture maker rebates"
+    )
+    post_only_retry_limit: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum retries for adjusting maker post-only limit price"
+    )
+    post_only_timeout_sec: float = Field(
+        default=2.5,
+        ge=0.5,
+        le=15.0,
+        description="Timeout waiting for maker fill before recalculating or aggressive IOC"
+    )
+    bracket_tp_atr_mult: float = Field(
+        default=1.2,
+        ge=0.4,
+        le=5.0,
+        description="ATR multiplier for native Take Profit bracket"
+    )
+    bracket_sl_atr_mult: float = Field(
+        default=0.8,
+        ge=0.2,
+        le=3.0,
+        description="ATR multiplier for native Stop Loss bracket"
+    )
+    trailing_stop: bool = Field(
+        default=True,
+        description="Enable dynamic trailing stop adjustment as position moves in profit"
+    )
+    slippage_tolerance_bps: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=30.0,
+        description="Maximum slippage tolerance in basis points for IOC orders"
+    )
+
+
+class StrategyConfig(BaseModel):
+    """Algorithmic trend and regime parameters."""
+    symbols: List[str] = Field(
+        default_factory=lambda: ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        min_length=1,
+        description="Trading pair tickers"
+    )
+    timeframes: List[str] = Field(
+        default_factory=lambda: ["1m", "5m", "15m"],
+        description="Multi-timeframe analysis intervals"
+    )
+    ema_fast: int = Field(default=9, ge=3, le=20)
+    ema_mid: int = Field(default=21, ge=10, le=50)
+    ema_slow: int = Field(default=50, ge=30, le=200)
+    vwap_window_mins: int = Field(default=60, ge=15, le=240)
+    atr_period: int = Field(default=14, ge=5, le=50)
+    ofi_depth_levels: int = Field(default=20, ge=5, le=50)
+    kelly_scale: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=1.0,
+        description="Half-Kelly scaling factor"
+    )
+    auto_tuning_trade_interval: int = Field(
+        default=20,
+        ge=10,
+        le=100,
+        description="Number of closed trades between parameter auto-tuning passes"
+    )
+
+
+class TelegramConfig(BaseModel):
+    """Telegram notifications and emergency shutoff listener."""
+    enabled: bool = Field(default=False)
+    bot_token: Optional[str] = Field(default=None)
+    chat_id: Optional[str] = Field(default=None)
+    poll_commands: bool = Field(default=True)
+
+
+class AppConfig(BaseModel):
+    """Root Engine Configuration."""
+    trading_mode: TradingMode = Field(default=TradingMode.LINEAR)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    data_dir: Path = Field(default_factory=lambda: Path("data"))
+    log_dir: Path = Field(default_factory=lambda: Path("logs"))
+
+    @field_validator("data_dir", "log_dir", mode="before")
+    @classmethod
+    def resolve_paths(cls, v: str | Path) -> Path:
+        p = Path(v)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+
+# =====================================================================
+# SECURE STORAGE & CREDENTIAL ENCRYPTION (Fernet with chmod 600 key)
+# =====================================================================
+
+KEY_FILE_NAME = ".engine_key"
+SECRETS_FILE_NAME = "secrets.enc"
+CONFIG_FILE_NAME = "config.json"
+
+
+def get_base_dir() -> Path:
+    """Returns application root directory."""
+    return Path(__file__).resolve().parent
+
+
+def get_or_create_master_key(base_dir: Optional[Path] = None) -> bytes:
+    """
+    Loads or generates a cryptographically secure 256-bit Fernet key.
+    Enforces POSIX file permissions 0600 (owner read/write only).
+    """
+    if base_dir is None:
+        base_dir = get_base_dir()
+    key_path = base_dir / KEY_FILE_NAME
+
+    if key_path.exists():
+        # Check permissions
+        mode = stat.S_IMODE(os.stat(key_path).st_mode)
+        if mode != 0o600 and os.name == "posix":
+            os.chmod(key_path, 0o600)
+        return key_path.read_bytes().strip()
+
+    # Generate new key
+    key = Fernet.generate_key()
+    with open(key_path, "wb") as f:
+        f.write(key)
+    if os.name == "posix":
+        os.chmod(key_path, 0o600)
+    return key
+
+
+def save_credentials(creds: BybitCredentials, base_dir: Optional[Path] = None) -> None:
+    """Encrypts credentials and stores them securely with 0600 permissions."""
+    if base_dir is None:
+        base_dir = get_base_dir()
+    key = get_or_create_master_key(base_dir)
+    fernet = Fernet(key)
+
+    payload = creds.model_dump_json().encode("utf-8")
+    encrypted_data = fernet.encrypt(payload)
+
+    secrets_path = base_dir / SECRETS_FILE_NAME
+    with open(secrets_path, "wb") as f:
+        f.write(encrypted_data)
+    if os.name == "posix":
+        os.chmod(secrets_path, 0o600)
+
+
+def load_credentials(base_dir: Optional[Path] = None) -> BybitCredentials:
+    """Decrypts credentials from encrypted store."""
+    if base_dir is None:
+        base_dir = get_base_dir()
+    secrets_path = base_dir / SECRETS_FILE_NAME
+    if not secrets_path.exists():
+        raise FileNotFoundError(
+            f"Encrypted secrets file not found at {secrets_path}. "
+            "Run installer.py or install.sh to initialize configuration."
+        )
+
+    key = get_or_create_master_key(base_dir)
+    fernet = Fernet(key)
+    encrypted_data = secrets_path.read_bytes()
+    decrypted_bytes = fernet.decrypt(encrypted_data)
+    data = json.loads(decrypted_bytes.decode("utf-8"))
+    return BybitCredentials(**data)
+
+
+def save_config(config: AppConfig, base_dir: Optional[Path] = None) -> None:
+    """Saves non-sensitive application settings to config.json."""
+    if base_dir is None:
+        base_dir = get_base_dir()
+    config_path = base_dir / CONFIG_FILE_NAME
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(config.model_dump_json(indent=2))
+    if os.name == "posix":
+        os.chmod(config_path, 0o640)
+
+
+def load_config(base_dir: Optional[Path] = None) -> AppConfig:
+    """Loads configuration, creating defaults if not yet present."""
+    if base_dir is None:
+        base_dir = get_base_dir()
+    config_path = base_dir / CONFIG_FILE_NAME
+    if not config_path.exists():
+        cfg = AppConfig()
+        save_config(cfg, base_dir)
+        return cfg
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return AppConfig(**data)
