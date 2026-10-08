@@ -175,7 +175,7 @@ class TradingEngine:
                                     pass
 
         if total_equity is not None:
-            self.risk_manager.update_wallet_balance(total_equity)
+            self.risk_manager.update_wallet_balance(total_equity, is_initial=True)
             logger.info(f"Connected to Bybit account. Current Equity: ${total_equity:,.2f}")
             await self.apply_capital_tier(total_equity, force=True)
         else:

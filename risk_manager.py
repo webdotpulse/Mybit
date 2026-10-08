@@ -51,7 +51,7 @@ class RiskManager:
         # Account Equity Tracking
         self.starting_equity: float = self.risk_cfg.allocated_capital_usd
         self.current_equity: float = self.risk_cfg.allocated_capital_usd
-        self.high_water_mark: float = self.risk_cfg.allocated_capital_usd
+        self.high_water_mark: Optional[float] = None
         self.last_day_reset: int = datetime.now(timezone.utc).day
 
         # Circuit Breaker States
@@ -69,28 +69,41 @@ class RiskManager:
         # Rolling 24h ATR memory for volatility spike detection
         self.rolling_atr_history: Dict[str, List[float]] = {}
 
-    def update_wallet_balance(self, total_equity: float) -> None:
+    def update_wallet_balance(self, total_equity: float, is_initial: bool = False) -> None:
         """Updates internal equity state and calculates daily drawdown."""
         current_day = datetime.now(timezone.utc).day
-        if current_day != self.last_day_reset:
-            logger.info("New UTC trading day. Resetting daily high-water mark and limits.")
+        if current_day != self.last_day_reset or self.high_water_mark is None or is_initial:
+            if current_day != self.last_day_reset and self.high_water_mark is not None:
+                logger.info("New UTC trading day. Resetting daily high-water mark and limits.")
             self.starting_equity = total_equity
             self.high_water_mark = total_equity
             self.daily_drawdown_tripped = False
             self.last_day_reset = current_day
 
         self.current_equity = total_equity
-        if total_equity > self.high_water_mark:
+        if total_equity > (self.high_water_mark or 0.0):
             self.high_water_mark = total_equity
 
         # Calculate drawdown relative to day's starting equity / HWM
-        drawdown_pct = ((self.high_water_mark - total_equity) / self.high_water_mark) * 100.0
-        if drawdown_pct >= self.risk_cfg.max_daily_risk_pct and not self.daily_drawdown_tripped:
-            self.daily_drawdown_tripped = True
-            logger.critical(
-                f"🚨 [CIRCUIT BREAKER] Max Daily Drawdown breached: {drawdown_pct:.2f}% >= "
-                f"{self.risk_cfg.max_daily_risk_pct}%. Trading halted for the day!"
-            )
+        if self.high_water_mark and self.high_water_mark > 0 and not is_initial:
+            drawdown_pct = ((self.high_water_mark - total_equity) / self.high_water_mark) * 100.0
+            if drawdown_pct >= self.risk_cfg.max_daily_risk_pct and not self.daily_drawdown_tripped:
+                self.daily_drawdown_tripped = True
+                logger.critical(
+                    f"🚨 [CIRCUIT BREAKER] Max Daily Drawdown breached: {drawdown_pct:.2f}% >= "
+                    f"{self.risk_cfg.max_daily_risk_pct}%. Trading halted for the day!"
+                )
+
+    def reset_circuit_breakers(self) -> None:
+        """Resets all circuit breaker trips and resumes normal trading."""
+        self.daily_drawdown_tripped = False
+        self.volatility_kill_tripped = False
+        self.consecutive_losses = 0
+        self.cooldown_until = 0.0
+        self.panic_triggered = False
+        self.high_water_mark = self.current_equity
+        self.starting_equity = self.current_equity
+        logger.info("All circuit breakers reset to clean state.")
 
     def record_trade_fill(self, pnl: float) -> None:
         """Tracks consecutive loss cutoff."""
