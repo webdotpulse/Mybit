@@ -72,8 +72,18 @@ case "$COMMAND" in
             echo -e "${RED}Error: Virtual environment not found. Run ./install.sh first.${RESET}"
             exit 1
         fi
-        echo -e "${GREEN}Starting Bybit V5 Web Executive Dashboard on http://127.0.0.1:8080...${RESET}"
-        $PYTHON web_server.py
+        if [ "$2" == "--public" ] || [ "$2" == "-p" ]; then
+            echo -e "${GREEN}Starting Bybit V5 Web Executive Dashboard on all interfaces (http://0.0.0.0:8080)...${RESET}"
+            echo -e "${CYAN}Access directly in your browser: ${BOLD}http://<YOUR_SERVER_IP>:8080${RESET}\n"
+            $PYTHON web_server.py --public "${@:3}"
+        else
+            echo -e "${GREEN}Starting Bybit V5 Web Executive Dashboard on http://127.0.0.1:8080...${RESET}"
+            echo -e "${CYAN}If running on a remote server, access via SSH tunnel from your local computer:${RESET}"
+            echo -e "  ${YELLOW}ssh -L 8080:localhost:8080 $(whoami)@<SERVER_IP>${RESET}"
+            echo -e "  Then open in your browser: ${BOLD}http://localhost:8080${RESET}"
+            echo -e "${CYAN}Or start publicly with:${RESET} ${YELLOW}./manage.sh web --public${RESET}\n"
+            $PYTHON web_server.py "$@"
+        fi
         ;;
 
     logs)

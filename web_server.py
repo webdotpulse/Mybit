@@ -147,5 +147,29 @@ def create_app() -> web.Application:
 
 
 if __name__ == "__main__":
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description="Bybit V5 Web Dashboard")
+    parser.add_argument(
+        "--host",
+        default=os.getenv("HOST", "127.0.0.1"),
+        help="Bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", 8080)),
+        help="Port (default: 8080)",
+    )
+    parser.add_argument(
+        "--public",
+        action="store_true",
+        help="Bind to 0.0.0.0 for external network access",
+    )
+    args = parser.parse_args()
+
+    bind_host = "0.0.0.0" if args.public else args.host
     app = create_app()
-    web.run_app(app, host="127.0.0.1", port=8080)
+    web.run_app(app, host=bind_host, port=args.port)
+
