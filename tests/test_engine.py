@@ -2,6 +2,7 @@
 Comprehensive Unit & Regression Test Suite for Bybit V5 Trading Engine.
 """
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -13,6 +14,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 import numpy as np
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from bybit_client import BybitV5Client, OrderBookL2
 from config import (
@@ -25,7 +27,7 @@ from config import (
     save_credentials,
 )
 from risk_manager import Position, RiskManager
-from strategy import Bar, MarketRegime, StrategyEngine
+from strategy import Bar, MarketRegime, StrategyEngine, TimeframeSeries
 from trade_journal import ParameterAutoTuner, TradeJournal, TradeRecord
 
 
@@ -528,6 +530,156 @@ def test_reconciliation_empty_strings():
     assert pos.unrealised_pnl == 0.0
     assert pos.take_profit is None
     assert pos.stop_loss is None
+
+
+def test_breakeven_stop_advancement():
+    """Verifies that RiskManager advances Stop Loss to entry + fee buffer when mark price reaches trigger."""
+    config = AppConfig()
+    config.execution.breakeven_atr_trigger = 0.85
+    config.execution.breakeven_buffer_bps = 8.0
+
+    creds = BybitCredentials(api_key="test_api_key_123", api_secret="test_api_secret_456", testnet=True)
+    client = BybitV5Client(creds)
+    client.set_trading_stop = AsyncMock(return_value={"retCode": 0, "retMsg": "OK"})
+
+    rm = RiskManager(config, client)
+
+    # Position with entry price $100.0, ATR $2.0. Trigger distance is 0.85 * 2.0 = $1.70. Trigger price = $101.70.
+    rm.positions["SOLUSDT"] = Position(
+        symbol="SOLUSDT",
+        side="Buy",
+        size=1.0,
+        entry_price=100.0,
+        mark_price=101.0,  # Below trigger ($101.70)
+        unrealised_pnl=1.0,
+        leverage=5,
+        stop_loss=98.0,
+        entry_atr=2.0,
+        breakeven_set=False,
+    )
+
+    # Test below trigger
+    updates = asyncio.run(rm.evaluate_position_stops())
+    assert len(updates) == 0
+    assert rm.positions["SOLUSDT"].breakeven_set is False
+
+    # Price moves to $102.0 (exceeds $101.70 trigger)
+    rm.positions["SOLUSDT"].mark_price = 102.0
+    updates = asyncio.run(rm.evaluate_position_stops())
+    assert len(updates) == 1
+    assert updates[0]["type"] == "BREAKEVEN_SET"
+    assert rm.positions["SOLUSDT"].breakeven_set is True
+    # New SL should be entry ($100) + 8 bps buffer ($0.08) = $100.08
+    assert rm.positions["SOLUSDT"].stop_loss == 100.08
+    client.set_trading_stop.assert_called_once_with(symbol="SOLUSDT", stop_loss=100.08)
+
+
+def test_stagnant_position_exit():
+    """Verifies that positions open longer than stagnant_exit_mins with no movement are closed."""
+    config = AppConfig()
+    config.execution.stagnant_exit_mins = 45
+    config.execution.stagnant_atr_threshold = 0.25
+
+    creds = BybitCredentials(api_key="test_api_key_123", api_secret="test_api_secret_456", testnet=True)
+    client = BybitV5Client(creds)
+    client.create_order = AsyncMock(return_value={"retCode": 0, "retMsg": "OK"})
+
+    rm = RiskManager(config, client)
+
+    # Position opened 50 minutes ago, entry $100.0, mark $100.10, ATR $2.0
+    # Price delta ($0.10) is <= 0.25 * 2.0 ($0.50) -> stagnant!
+    rm.positions["SOLUSDT"] = Position(
+        symbol="SOLUSDT",
+        side="Buy",
+        size=2.0,
+        entry_price=100.0,
+        mark_price=100.10,
+        unrealised_pnl=0.20,
+        leverage=5,
+        entry_atr=2.0,
+        opened_at=time.time() - (50 * 60),  # 50 minutes ago
+    )
+
+    closed = asyncio.run(rm.check_stagnant_positions())
+    assert len(closed) == 1
+    assert closed[0]["symbol"] == "SOLUSDT"
+    client.create_order.assert_called_once_with(
+        symbol="SOLUSDT",
+        side="Sell",
+        order_type="Market",
+        qty=2.0,
+        time_in_force="IOC",
+        reduce_only=True,
+    )
+
+
+def test_funding_rate_filtering():
+    """Verifies that StrategyEngine suppresses signals trading into adverse funding rates."""
+    config = AppConfig()
+    config.execution.funding_rate_filter = True
+    config.execution.max_adverse_funding_rate = 0.0003  # 0.03%
+
+    strat = StrategyEngine(config)
+    tf_1m = TimeframeSeries("SOLUSDT", "1m")
+    tf_5m = TimeframeSeries("SOLUSDT", "5m")
+    strat.series["SOLUSDT"] = {"1m": tf_1m, "5m": tf_5m}
+
+    # Populate bullish bars
+    for i in range(70):
+        p = 100.0 + i * 0.5
+        b = Bar(timestamp=1000 + i * 60, open=p, high=p + 0.5, low=p - 0.2, close=p + 0.3, volume=500)
+        tf_1m.add_or_update_bar(b)
+        tf_5m.add_or_update_bar(b)
+
+    ob = OrderBookL2("SOLUSDT")
+    curr_px = tf_1m.bars[-1].close
+    ob.bids = {curr_px - 0.01: 50.0}
+    ob.asks = {curr_px + 0.01: 50.0}
+    ob.ofi = 10.0
+
+    # 1. Normal funding rate (+0.01%): Long signal should be generated
+    sig_normal = strat.generate_signal("SOLUSDT", ob, funding_rate=0.0001)
+    assert sig_normal is not None
+    assert sig_normal.side == "Buy"
+
+    # 2. Heavy positive funding rate (+0.05% > 0.03%): Long signal should be suppressed
+    sig_adverse = strat.generate_signal("SOLUSDT", ob, funding_rate=0.0005)
+    assert sig_adverse is None
+
+
+def test_quantitative_backtester_simulation():
+    """Verifies that QuantitativeBacktester accurately executes offline simulations."""
+    from backtester import QuantitativeBacktester
+
+    config = AppConfig()
+    config.risk.allocated_capital_usd = 100.0
+    config.risk.default_leverage = 5
+
+    bt = QuantitativeBacktester(config, initial_capital=100.0)
+
+    # Generate synthetic trending bars with expanding volatility
+    bars = []
+    price = 0.0800
+    for i in range(200):
+        # Create an upward trend with occasional swings
+        delta = 0.0002 if (i % 5 != 0) else -0.0001
+        price += delta
+        b = Bar(
+            timestamp=1700000000000 + (i * 60000),
+            open=round(price, 5),
+            high=round(price + 0.0004, 5),
+            low=round(price - 0.0002, 5),
+            close=round(price + 0.0001, 5),
+            volume=50000.0,
+        )
+        bars.append(b)
+
+    result = bt.run("DOGEUSDT", bars)
+    assert result.total_bars == 200
+    assert result.initial_capital == 100.0
+    assert isinstance(result.final_equity, float)
+    assert isinstance(result.win_rate, float)
+    assert isinstance(result.max_drawdown_pct, float)
 
 
 

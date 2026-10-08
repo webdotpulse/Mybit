@@ -52,6 +52,10 @@ class Position:
     take_profit: Optional[float] = None
     stop_loss: Optional[float] = None
     trailing_stop: Optional[float] = None
+    entry_atr: float = 0.0
+    breakeven_set: bool = False
+    opened_at: float = field(default_factory=time.time)
+    entry_features: Dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
 
 
@@ -212,6 +216,7 @@ class RiskManager:
                 symbol = p.get("symbol", "")
                 if size > 0:
                     current_symbols.add(symbol)
+                    existing = self.positions.get(symbol)
                     self.positions[symbol] = Position(
                         symbol=symbol,
                         side=p.get("side", ""),
@@ -223,6 +228,10 @@ class RiskManager:
                         take_profit=_to_float(p.get("takeProfit")) or None,
                         stop_loss=_to_float(p.get("stopLoss")) or None,
                         trailing_stop=_to_float(p.get("trailingStop")) or None,
+                        entry_atr=existing.entry_atr if existing else 0.0,
+                        breakeven_set=existing.breakeven_set if existing else False,
+                        opened_at=existing.opened_at if existing else time.time(),
+                        entry_features=existing.entry_features if existing else {},
                     )
                 else:
                     self.positions.pop(symbol, None)
@@ -292,3 +301,137 @@ class RiskManager:
             logger.critical(f"Fatal error during panic stop: {e}")
             results["error"] = str(e)
         return results
+
+    async def evaluate_position_stops(self) -> List[Dict[str, Any]]:
+        """
+        Evaluates active positions for Breakeven advancement and Trailing Stop protection.
+        When unrealized profit reaches +breakeven_atr_trigger * entry_atr,
+        advances Stop Loss to entry price + fee buffer (Breakeven).
+        """
+        updates = []
+        exec_cfg = self.config.execution
+        if exec_cfg.breakeven_atr_trigger <= 0:
+            return updates
+
+        for symbol, pos in list(self.positions.items()):
+            if pos.size <= 0 or pos.entry_price <= 0:
+                continue
+
+            atr = pos.entry_atr
+            if atr <= 0:
+                continue
+
+            # Breakeven Stop-Loss Check
+            if not pos.breakeven_set:
+                trigger_dist = exec_cfg.breakeven_atr_trigger * atr
+                fee_buffer = pos.entry_price * (exec_cfg.breakeven_buffer_bps / 10000.0)
+
+                if pos.side == "Buy":
+                    # For Long: if mark_price >= entry_price + trigger_dist
+                    if pos.mark_price >= (pos.entry_price + trigger_dist):
+                        new_sl = round(pos.entry_price + fee_buffer, 4)
+                        if pos.stop_loss is None or new_sl > pos.stop_loss:
+                            logger.info(
+                                f"🛡️ [{symbol}] Advancing Stop Loss to Breakeven (+${fee_buffer:.4f} fee buffer): "
+                                f"Mark ${pos.mark_price:.4f} >= Trigger ${pos.entry_price + trigger_dist:.4f}"
+                            )
+                            res = await self.client.set_trading_stop(
+                                symbol=symbol,
+                                stop_loss=new_sl,
+                            )
+                            if res.get("retCode") == 0:
+                                pos.stop_loss = new_sl
+                                pos.breakeven_set = True
+                                updates.append({
+                                    "symbol": symbol,
+                                    "type": "BREAKEVEN_SET",
+                                    "side": pos.side,
+                                    "new_sl": new_sl,
+                                    "mark_price": pos.mark_price,
+                                })
+                            else:
+                                logger.warning(f"Failed to set breakeven stop on {symbol}: {res.get('retMsg')}")
+                elif pos.side == "Sell":
+                    # For Short: if mark_price <= entry_price - trigger_dist
+                    if pos.mark_price <= (pos.entry_price - trigger_dist):
+                        new_sl = round(pos.entry_price - fee_buffer, 4)
+                        if pos.stop_loss is None or new_sl < pos.stop_loss:
+                            logger.info(
+                                f"🛡️ [{symbol}] Advancing Short Stop Loss to Breakeven (-${fee_buffer:.4f} fee buffer): "
+                                f"Mark ${pos.mark_price:.4f} <= Trigger ${pos.entry_price - trigger_dist:.4f}"
+                            )
+                            res = await self.client.set_trading_stop(
+                                symbol=symbol,
+                                stop_loss=new_sl,
+                            )
+                            if res.get("retCode") == 0:
+                                pos.stop_loss = new_sl
+                                pos.breakeven_set = True
+                                updates.append({
+                                    "symbol": symbol,
+                                    "type": "BREAKEVEN_SET",
+                                    "side": pos.side,
+                                    "new_sl": new_sl,
+                                    "mark_price": pos.mark_price,
+                                })
+                            else:
+                                logger.warning(f"Failed to set breakeven stop on {symbol}: {res.get('retMsg')}")
+
+        return updates
+
+    async def check_stagnant_positions(self) -> List[Dict[str, Any]]:
+        """
+        Detects positions open longer than stagnant_exit_mins where price has not moved
+        meaningfully (within stagnant_atr_threshold * ATR), indicating market chop.
+        Liquidates stagnant positions to free capital and prevent overnight decay.
+        """
+        closed_positions = []
+        exec_cfg = self.config.execution
+        if exec_cfg.stagnant_exit_mins <= 0:
+            return closed_positions
+
+        timeout_sec = exec_cfg.stagnant_exit_mins * 60
+
+        for symbol, pos in list(self.positions.items()):
+            if pos.size <= 0 or pos.entry_price <= 0:
+                continue
+
+            duration = time.time() - pos.opened_at
+            if duration >= timeout_sec:
+                atr = pos.entry_atr
+                price_delta = abs(pos.mark_price - pos.entry_price)
+                is_stagnant = False
+
+                if atr > 0:
+                    is_stagnant = price_delta <= (exec_cfg.stagnant_atr_threshold * atr)
+                else:
+                    is_stagnant = (price_delta / pos.entry_price) < 0.002
+
+                if is_stagnant:
+                    duration_mins = int(duration / 60)
+                    logger.warning(
+                        f"⏳ [{symbol}] Position stagnant for {duration_mins}m with price delta "
+                        f"${price_delta:.4f} <= {exec_cfg.stagnant_atr_threshold}x ATR. Closing position..."
+                    )
+                    close_side = "Sell" if pos.side == "Buy" else "Buy"
+                    res = await self.client.create_order(
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Market",
+                        qty=pos.size,
+                        time_in_force="IOC",
+                        reduce_only=True,
+                    )
+                    if res.get("retCode") == 0:
+                        closed_positions.append({
+                            "symbol": symbol,
+                            "side": pos.side,
+                            "size": pos.size,
+                            "duration_mins": duration_mins,
+                            "mark_price": pos.mark_price,
+                        })
+                        logger.info(f"✅ Stagnant position on {symbol} closed successfully.")
+                    else:
+                        logger.error(f"Failed to close stagnant position on {symbol}: {res.get('retMsg')}")
+
+        return closed_positions

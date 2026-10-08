@@ -549,6 +549,28 @@ class BybitV5Client:
 
         return await self.request("POST", "/v5/position/trading-stop", data=data, auth_required=True)
 
+    async def get_tickers(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Queries market tickers including 24h stats, mark price, and funding rate."""
+        params: Dict[str, Any] = {"category": self.category}
+        if symbol:
+            params["symbol"] = symbol
+        res = await self.request("GET", "/v5/market/tickers", params=params, auth_required=False)
+        if res.get("retCode") == 0:
+            return (res.get("result") or {}).get("list") or []
+        return []
+
+    async def get_funding_rate(self, symbol: str) -> float:
+        """Fetches current funding rate for a linear perpetual symbol."""
+        if self.category != "linear":
+            return 0.0
+        tickers = await self.get_tickers(symbol=symbol)
+        if tickers:
+            try:
+                return float(tickers[0].get("fundingRate") or 0.0)
+            except (ValueError, TypeError):
+                return 0.0
+        return 0.0
+
     async def get_klines(
         self,
         symbol: str,

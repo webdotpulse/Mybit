@@ -294,6 +294,7 @@ class StrategyEngine:
         self,
         symbol: str,
         orderbook: OrderBookL2,
+        funding_rate: float = 0.0,
     ) -> Optional[Signal]:
         """
         Synthesizes technical features and orderbook micro-structure into actionable signals.
@@ -325,11 +326,32 @@ class StrategyEngine:
         tp_atr_mult = self.exec_cfg.bracket_tp_atr_mult
         sl_atr_mult = self.exec_cfg.bracket_sl_atr_mult
 
+        # Adverse Funding Rate Filter helper
+        def is_funding_adverse(trade_side: str) -> bool:
+            if not self.exec_cfg.funding_rate_filter:
+                return False
+            max_fr = self.exec_cfg.max_adverse_funding_rate
+            if trade_side == "Buy" and funding_rate > max_fr:
+                logger.info(
+                    f"[{symbol}] Suppressing LONG entry: funding rate {funding_rate*100:.4f}% > "
+                    f"adverse threshold {max_fr*100:.4f}%"
+                )
+                return True
+            elif trade_side == "Sell" and funding_rate < -max_fr:
+                logger.info(
+                    f"[{symbol}] Suppressing SHORT entry: funding rate {funding_rate*100:.4f}% < "
+                    f"-{max_fr*100:.4f}%"
+                )
+                return True
+            return False
+
         # High-Conviction Breakout Momentum (Volatility Expansion)
         if regime == MarketRegime.VOLATILITY_EXPANSION:
             # Direction determined by VWAP and OFI
             if metrics["close"] > metrics["vwap"] and orderbook.ofi > 0:
                 side = "Buy"
+                if is_funding_adverse(side):
+                    return None
                 # Aggressive breakout: IOC limit slightly inside best ask
                 price = best_ask
                 tp_price = round(price + (tp_atr_mult * atr), 4)
@@ -350,6 +372,8 @@ class StrategyEngine:
                 )
             elif metrics["close"] < metrics["vwap"] and orderbook.ofi < 0:
                 side = "Sell"
+                if is_funding_adverse(side):
+                    return None
                 price = best_bid
                 tp_price = round(price - (tp_atr_mult * atr), 4)
                 sl_price = round(price + (sl_atr_mult * atr), 4)
@@ -372,6 +396,8 @@ class StrategyEngine:
         # Maker-First Trend Scalping (BULL_TREND / BEAR_TREND)
         if regime == MarketRegime.BULL_TREND:
             side = "Buy"
+            if is_funding_adverse(side):
+                return None
             # PostOnly limit: sit at best bid to earn maker rebate
             price = best_bid
             tp_price = round(price + (tp_atr_mult * atr), 4)
@@ -395,6 +421,8 @@ class StrategyEngine:
 
         elif regime == MarketRegime.BEAR_TREND:
             side = "Sell"
+            if is_funding_adverse(side):
+                return None
             # PostOnly limit: sit at best ask
             price = best_ask
             tp_price = round(price - (tp_atr_mult * atr), 4)

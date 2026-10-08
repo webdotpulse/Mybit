@@ -132,6 +132,7 @@ Use the companion script `./manage.sh` for all daily operations:
 | Command | Action |
 | :--- | :--- |
 | `./manage.sh status` | Displays the Rich terminal dashboard (Equity, Drawdown, Circuit Breakers, Positions, Win Rate). |
+| `./manage.sh backtest` | Runs quantitative backtest simulations with realistic fees and ATR brackets (`./manage.sh backtest --symbol DOGEUSDT --bars 3000`). |
 | `./manage.sh web` | Starts the local Web Executive Dashboard and Installer UI on `http://127.0.0.1:8080`. |
 | `./manage.sh logs` | Tails live real-time streaming application logs. |
 | `./manage.sh panic` | **EMERGENCY**: Instantly cancels all open orders and closes all positions via Market orders. |

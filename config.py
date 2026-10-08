@@ -11,7 +11,7 @@ import os
 import stat
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -55,25 +55,27 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
                 "symbols": ["DOGEUSDT", "SUIUSDT", "SOLUSDT"],
                 "max_open_positions": 1,
                 "max_daily_risk_pct": 5.0,  # 5% gives breathing room on micro accounts
-                "min_position_equity_pct": 2.5,
-                "max_position_equity_pct": 6.0,
+                "min_position_equity_pct": 2.0,
+                "max_position_equity_pct": 5.0,
                 "default_leverage": 5,
                 "auto_tuning_interval": 15,
-                "description": "Micro/Bootstrap Tier ($10 - $99). Low-notional altcoins, max 1 position, 5% daily risk."
+                "description": "Micro/Bootstrap Tier ($10 - $99). Low-notional altcoins (DOGE/SUI/SOL), max 1 position, 5% daily risk."
             }
         )
     elif equity < 1000.0:
+        # Accounts under $250 stick to DOGE, SUI, and SOL (excluding ETH to prevent overexposure)
+        active_symbols = ["DOGEUSDT", "SUIUSDT", "SOLUSDT"] if equity < 250.0 else ["DOGEUSDT", "SUIUSDT", "SOLUSDT", "ETHUSDT"]
         return (
             CapitalTier.GROWTH_SMALL,
             {
-                "symbols": ["ETHUSDT", "SOLUSDT", "SUIUSDT", "DOGEUSDT"],
+                "symbols": active_symbols,
                 "max_open_positions": 2,
                 "max_daily_risk_pct": 3.5,
                 "min_position_equity_pct": 0.75,
                 "max_position_equity_pct": 1.5,
                 "default_leverage": 5,
                 "auto_tuning_interval": 20,
-                "description": "Growth Tier ($100 - $999). Broad liquid pairs, max 2 concurrent positions, 3.5% daily risk."
+                "description": f"Growth Tier (${int(equity)} USD). Highly liquid pairs, max 2 concurrent positions, 3.5% daily risk."
             }
         )
     elif equity < 10000.0:
@@ -204,6 +206,46 @@ class ExecutionConfig(BaseModel):
     trailing_stop: bool = Field(
         default=True,
         description="Enable dynamic trailing stop adjustment as position moves in profit"
+    )
+    breakeven_atr_trigger: float = Field(
+        default=0.85,
+        ge=0.2,
+        le=2.0,
+        description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
+    )
+    breakeven_buffer_bps: float = Field(
+        default=8.0,
+        ge=0.0,
+        le=50.0,
+        description="Buffer in basis points above entry price when setting Breakeven Stop Loss"
+    )
+    stagnant_exit_mins: int = Field(
+        default=45,
+        ge=5,
+        le=240,
+        description="Holding minutes after which a stagnant scalp position is evaluated for exit"
+    )
+    stagnant_atr_threshold: float = Field(
+        default=0.25,
+        ge=0.05,
+        le=1.0,
+        description="Price must be within this ATR multiple of entry to trigger stagnant exit"
+    )
+    funding_rate_filter: bool = Field(
+        default=True,
+        description="Filter trades against adverse perpetual funding rates"
+    )
+    max_adverse_funding_rate: float = Field(
+        default=0.0003,
+        ge=0.0001,
+        le=0.002,
+        description="Maximum adverse funding rate (0.03%) before suppressing trend entries"
+    )
+    trade_cooldown_mins: int = Field(
+        default=3,
+        ge=0,
+        le=60,
+        description="Minimum cooldown in minutes after trade exit before re-entering same pair"
     )
     slippage_tolerance_bps: float = Field(
         default=5.0,

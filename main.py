@@ -64,6 +64,11 @@ class TradingEngine:
         self._running = False
         self._background_tasks: list[asyncio.Task] = []
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
+        self._position_context: Dict[str, Dict[str, Any]] = {}
+        self._order_context: Dict[str, Dict[str, Any]] = {}
+        self._funding_rates: Dict[str, float] = {}
+        self._last_funding_fetch: float = 0.0
+        self._last_trade_exit: Dict[str, float] = {}
         self._last_pos_heartbeat: float = 0.0
         self.status_file = self.config.data_dir / "engine_status.json"
 
@@ -229,11 +234,51 @@ class TradingEngine:
         """Starts main loops: strategy execution, reconciliation, and status IPC."""
         self._background_tasks.append(asyncio.create_task(self._reconciliation_loop()))
         self._background_tasks.append(asyncio.create_task(self._strategy_decision_loop()))
+        self._background_tasks.append(asyncio.create_task(self._position_guardian_loop()))
         self._background_tasks.append(asyncio.create_task(self._status_publisher_loop()))
 
         logger.info("Trading engine execution loops active. Awaiting regime opportunities...")
         while self._running:
             await asyncio.sleep(1)
+
+    async def _position_guardian_loop(self) -> None:
+        """
+        Active Position Guardian:
+        1. Checks unrealized profits and advances Stop Loss to Breakeven (+ fees) at +0.6x ATR.
+        2. Detects stagnant scalps open longer than stagnant_exit_mins and liquidates them.
+        """
+        while self._running:
+            try:
+                # 1. Evaluate Breakeven and Trailing stops
+                stop_updates = await self.risk_manager.evaluate_position_stops()
+                for update in stop_updates:
+                    sym = update["symbol"]
+                    new_sl = update["new_sl"]
+                    await self.telegram.send_message(
+                        f"🛡️ *Breakeven Protected: {sym}*\n"
+                        f"• Side: `{update['side']}`\n"
+                        f"• Stop-Loss Advanced to: `${new_sl}`\n"
+                        f"• Current Mark: `${update['mark_price']:.4f}`\n"
+                        f"• Status: Risk-free trade locked in!"
+                    )
+
+                # 2. Check for stagnant positions
+                stagnant_closed = await self.risk_manager.check_stagnant_positions()
+                for closed in stagnant_closed:
+                    sym = closed["symbol"]
+                    dur = closed["duration_mins"]
+                    await self.telegram.send_message(
+                        f"⏳ *Stagnant Position Exited: {sym}*\n"
+                        f"• Position open for `{dur}` minutes without price expansion.\n"
+                        f"• Closed at market (${closed['mark_price']:.4f}) to protect margin."
+                    )
+
+                await asyncio.sleep(2.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in position guardian loop: {e}")
+                await asyncio.sleep(5.0)
 
     async def _on_kline_update(self, symbol: str, interval: str, kline: Dict[str, Any]) -> None:
         """Ingests live kline updates into the feature engine."""
@@ -269,30 +314,37 @@ class TradingEngine:
                 self.risk_manager.record_trade_fill(closed_pnl)
                 self.strategy.record_trade_result(closed_pnl)
 
-                # Create trade journal entry
+                # Retrieve saved position context for accurate feature recording
+                ctx = self._position_context.pop(symbol, {})
+                entry_px = float(ctx.get("price") or exec_price)
+                entry_ts = int(ctx.get("placed_at", exec_time / 1000.0 - 30.0) * 1000)
+                holding_sec = max(1.0, round((exec_time - entry_ts) / 1000.0, 1))
+
+                # Create trade journal entry with full quantitative context
                 tr = TradeRecord(
                     trade_id=order_link_id or order_id,
                     symbol=symbol,
                     side=side,
-                    entry_time=exec_time - 30000,  # approximate
+                    entry_time=entry_ts,
                     exit_time=exec_time,
-                    holding_time_sec=30.0,
-                    entry_price=exec_price,
+                    holding_time_sec=holding_sec,
+                    entry_price=entry_px,
                     exit_price=exec_price,
                     qty=exec_qty,
                     realized_pnl=closed_pnl,
-                    realized_pnl_pct=(closed_pnl / max(1.0, exec_price * exec_qty)) * 100.0,
+                    realized_pnl_pct=(closed_pnl / max(1.0, entry_px * exec_qty)) * 100.0,
                     fee_paid=exec_fee,
-                    slippage_bps=0.0,
+                    slippage_bps=round(abs(exec_price - entry_px) / entry_px * 10000.0, 1) if entry_px > 0 else 0.0,
                     order_type="Maker" if is_maker else "Taker",
-                    regime="ACTIVE",
-                    conviction=0.8,
-                    atr_at_entry=0.0,
-                    ema_spread_at_entry=0.0,
-                    vwap_delta_at_entry=0.0,
-                    ofi_at_entry=0.0,
+                    regime=str(ctx.get("regime", "ACTIVE")),
+                    conviction=float(ctx.get("conviction", 0.8)),
+                    atr_at_entry=float(ctx.get("atr", 0.0)),
+                    ema_spread_at_entry=float(ctx.get("ema_spread", 0.0)),
+                    vwap_delta_at_entry=float(ctx.get("vwap_delta", 0.0)),
+                    ofi_at_entry=float(ctx.get("ofi", 0.0)),
                 )
                 self.journal.record_trade(tr)
+                self._last_trade_exit[symbol] = time.time()
 
                 # Send Telegram fill alert
                 await self.telegram.send_trade_exit(
@@ -301,7 +353,7 @@ class TradingEngine:
                     exit_price=exec_price,
                     pnl=closed_pnl,
                     pnl_pct=tr.realized_pnl_pct,
-                    holding_sec=30.0,
+                    holding_sec=holding_sec,
                 )
 
                 # Trigger periodic auto-tuning
@@ -333,6 +385,13 @@ class TradingEngine:
             if not symbol:
                 return
             if size > 0:
+                existing = self.risk_manager.positions.get(symbol)
+                ctx = self._position_context.get(symbol, {})
+                entry_atr = existing.entry_atr if (existing and existing.entry_atr > 0) else float(ctx.get("atr", 0.0))
+                opened_at = existing.opened_at if (existing and existing.opened_at > 0) else float(ctx.get("placed_at", time.time()))
+                breakeven_set = existing.breakeven_set if existing else False
+                entry_features = existing.entry_features if existing else ctx
+
                 self.risk_manager.positions[symbol] = Position(
                     symbol=symbol,
                     side=pos_data.get("side", ""),
@@ -344,6 +403,10 @@ class TradingEngine:
                     take_profit=_to_float(pos_data.get("takeProfit")) or None,
                     stop_loss=_to_float(pos_data.get("stopLoss")) or None,
                     trailing_stop=_to_float(pos_data.get("trailingStop")) or None,
+                    entry_atr=entry_atr,
+                    breakeven_set=breakeven_set,
+                    opened_at=opened_at,
+                    entry_features=entry_features,
                 )
             else:
                 self.risk_manager.positions.pop(symbol, None)
@@ -392,6 +455,15 @@ class TradingEngine:
                     await asyncio.sleep(1.0)
                     continue
 
+                # Periodically update funding rates (every 3 minutes)
+                if now - self._last_funding_fetch > 180:
+                    self._last_funding_fetch = now
+                    for s in self.config.strategy.symbols:
+                        try:
+                            self._funding_rates[s] = await self.client.get_funding_rate(s)
+                        except Exception:
+                            pass
+
                 for symbol in self.config.strategy.symbols:
                     # Enforce strict capacity limit per tick
                     if (len(self.risk_manager.positions) + len(self._pending_orders)) >= self.config.risk.max_open_positions:
@@ -405,12 +477,18 @@ class TradingEngine:
                     if symbol in self.risk_manager.positions:
                         continue
 
+                    # Don't open if in post-trade cooldown for this symbol
+                    cooldown_sec = self.config.execution.trade_cooldown_mins * 60
+                    if (now - self._last_trade_exit.get(symbol, 0.0)) < cooldown_sec:
+                        continue
+
                     # Don't submit new order if there's already an active open/pending order for this symbol
                     if any(o.get("symbol") == symbol for o in self._pending_orders.values()):
                         continue
 
-                    # Generate signal
-                    signal = self.strategy.generate_signal(symbol, ob)
+                    # Generate signal with adverse funding filter
+                    fr = self._funding_rates.get(symbol, 0.0)
+                    signal = self.strategy.generate_signal(symbol, ob, funding_rate=fr)
                     if signal:
                         await self._execute_signal(signal, ob)
 
@@ -490,6 +568,21 @@ class TradingEngine:
             mkt_ret_code = mkt_res.get("retCode", -1)
             if mkt_ret_code == 0:
                 order_id = (mkt_res.get("result") or {}).get("orderId", "")
+                ctx = {
+                    "symbol": sig.symbol,
+                    "side": sig.side,
+                    "price": sig.price,
+                    "qty": qty,
+                    "placed_at": time.time(),
+                    "regime": sig.regime.value,
+                    "conviction": sig.conviction,
+                    "atr": sig.atr,
+                    "ema_spread": sig.metadata.get("ema9", 0.0) - sig.metadata.get("ema50", 0.0),
+                    "vwap_delta": sig.price - sig.metadata.get("vwap", sig.price),
+                    "ofi": sig.metadata.get("ofi", 0.0),
+                }
+                self._position_context[sig.symbol] = ctx
+                self._order_context[order_id] = ctx
                 self._pending_orders[order_id] = {
                     "symbol": sig.symbol,
                     "side": sig.side,
@@ -517,6 +610,21 @@ class TradingEngine:
                 )
         elif ret_code == 0:
             order_id = (res.get("result") or {}).get("orderId", "")
+            ctx = {
+                "symbol": sig.symbol,
+                "side": sig.side,
+                "price": sig.price,
+                "qty": qty,
+                "placed_at": time.time(),
+                "regime": sig.regime.value,
+                "conviction": sig.conviction,
+                "atr": sig.atr,
+                "ema_spread": sig.metadata.get("ema9", 0.0) - sig.metadata.get("ema50", 0.0),
+                "vwap_delta": sig.price - sig.metadata.get("vwap", sig.price),
+                "ofi": sig.metadata.get("ofi", 0.0),
+            }
+            self._position_context[sig.symbol] = ctx
+            self._order_context[order_id] = ctx
             self._pending_orders[order_id] = {
                 "symbol": sig.symbol,
                 "side": sig.side,

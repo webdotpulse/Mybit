@@ -420,6 +420,10 @@ def main() -> None:
         switch_environment(testnet=True)
     elif cmd == "panic":
         asyncio.run(execute_panic_async())
+    elif cmd in ("backtest", "sim", "simulate"):
+        from backtester import main as backtest_main
+        sys.argv.pop(1)
+        backtest_main()
     else:
         console.print(f"[red]Unknown command: {cmd}[/red]")
         sys.exit(1)

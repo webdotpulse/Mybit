@@ -41,6 +41,7 @@ usage() {
     echo "  mainnet  - Switch environment to Live Mainnet (api.bybit.com)"
     echo "  testnet  - Switch environment to Testnet (api-testnet.bybit.com)"
     echo "  web      - Launch the Web Admin Executive Dashboard & Installer (port 8080)"
+    echo "  backtest - Run quantitative backtest simulation on historical Bybit data"
     echo "  logs     - Stream live real-time engine execution logs"
     echo "  panic    - EMERGENCY: Cancel all open orders and market close all positions"
     echo "  update   - Pull latest git updates, sync virtualenv, and restart daemon"
@@ -102,6 +103,15 @@ case "$COMMAND" in
             echo -e "${CYAN}Or start publicly with:${RESET} ${YELLOW}./manage.sh web --public${RESET}\n"
             $PYTHON web_server.py "$@"
         fi
+        ;;
+
+    backtest|sim|simulate)
+        if [ ! -f "$PYTHON" ]; then
+            echo -e "${RED}Error: Virtual environment not found. Run ./install.sh first.${RESET}"
+            exit 1
+        fi
+        shift
+        $PYTHON manage_cli.py backtest "$@"
         ;;
 
     logs)
