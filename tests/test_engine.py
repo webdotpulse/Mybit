@@ -291,3 +291,156 @@ def test_auto_capital_tier_by_equity():
     assert cfg_25k["max_daily_risk_pct"] == 2.0
     assert cfg_25k["default_leverage"] == 3
 
+
+class MockAsyncContext:
+    def __init__(self, obj):
+        self.obj = obj
+
+    async def __aenter__(self):
+        return self.obj
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return None
+
+
+def test_bybit_empty_and_error_response_handling():
+    """Ensures HTTP 403/502/empty responses do NOT raise 'NoneType' has no attribute 'get'."""
+    from unittest.mock import AsyncMock, MagicMock
+    import asyncio
+
+    async def _test():
+        creds = BybitCredentials(api_key="AK_TEST_KEY_1234", api_secret="AS_TEST_SECRET_5678", testnet=True)
+        client = BybitV5Client(creds)
+
+        mock_resp = MagicMock()
+        mock_resp.status = 403
+        mock_resp.text = AsyncMock(return_value="")
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.request = MagicMock(return_value=MockAsyncContext(mock_resp))
+
+        client.session = mock_session
+
+        res = await client.request("GET", "/v5/account/wallet-balance")
+        assert isinstance(res, dict)
+        assert res.get("retCode") == 403
+        assert "HTTP 403" in res.get("retMsg", "")
+
+    asyncio.run(_test())
+
+
+def test_bybit_null_json_response_handling():
+    """Ensures responses containing 'null' JSON parse cleanly without AttributeError."""
+    from unittest.mock import AsyncMock, MagicMock
+    import asyncio
+
+    async def _test():
+        creds = BybitCredentials(api_key="AK_TEST_KEY_1234", api_secret="AS_TEST_SECRET_5678", testnet=True)
+        client = BybitV5Client(creds)
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value="null")
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.request = MagicMock(return_value=MockAsyncContext(mock_resp))
+
+        client.session = mock_session
+
+        res = await client.request("GET", "/v5/account/wallet-balance")
+        assert isinstance(res, dict)
+        assert res.get("retCode") == 0 or res.get("retCode") == -1
+
+    asyncio.run(_test())
+
+
+def test_bybit_wallet_balance_contract_fallback():
+    """Verifies that if UTA wallet balance fails, it retries with CONTRACT mode."""
+    from unittest.mock import AsyncMock
+    import asyncio
+
+    async def _test():
+        creds = BybitCredentials(api_key="AK_TEST_KEY_1234", api_secret="AS_TEST_SECRET_5678", testnet=True)
+        client = BybitV5Client(creds)
+
+        async def mock_req(method, path, params=None, data=None, auth_required=True):
+            if params and params.get("accountType") == "UNIFIED":
+                return {"retCode": 10001, "retMsg": "accountType not valid for classic account", "result": {}}
+            elif params and params.get("accountType") == "CONTRACT":
+                return {
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {
+                        "list": [
+                            {
+                                "accountType": "CONTRACT",
+                                "totalEquity": "",
+                                "coin": [{"coin": "USDT", "equity": "250.0", "walletBalance": "250.0"}],
+                            }
+                        ]
+                    },
+                }
+            return {"retCode": -1, "result": {}}
+
+        client.request = AsyncMock(side_effect=mock_req)
+        res = await client.get_wallet_balance(account_type="UNIFIED")
+        assert res.get("retCode") == 0
+        item = res.get("result", {}).get("list", [{}])[0]
+        assert item.get("accountType") == "CONTRACT"
+        assert item.get("coin")[0]["equity"] == "250.0"
+
+    asyncio.run(_test())
+
+
+def test_trading_engine_wallet_equity_resilience():
+    """Verifies that TradingEngine.initialize() parses UTA, CONTRACT, and failure cases without crashing."""
+    from unittest.mock import AsyncMock, MagicMock
+    import asyncio
+    from main import TradingEngine
+
+    async def _test():
+        config = AppConfig()
+        config.risk.allocated_capital_usd = 500.0
+        creds = BybitCredentials(api_key="AK_TEST_KEY_1234", api_secret="AS_TEST_SECRET_5678", testnet=True)
+
+        engine = TradingEngine(config, creds)
+        # Mock telegram, ws, set_leverage, get_klines, etc.
+        engine.client.initialize = AsyncMock()
+        engine.telegram.initialize = AsyncMock()
+        engine.telegram.send_message = AsyncMock()
+        engine.client.set_leverage = AsyncMock(return_value=True)
+        engine.client.get_klines = AsyncMock(return_value=[])
+        engine.client.subscribe_orderbook = MagicMock()
+        engine.client.subscribe_kline = MagicMock()
+        engine.risk_manager.reconcile = AsyncMock()
+        engine.client.start_streams = AsyncMock()
+
+        # Case 1: Failure / Error code response (e.g. retCode 10010 or NoneType body)
+        engine.client.get_wallet_balance = AsyncMock(return_value={"retCode": 10010, "retMsg": "Unmatched IP", "result": None})
+        await engine.initialize()
+        assert engine.risk_manager.current_equity == 500.0  # Fallback worked smoothly!
+
+        # Case 2: CONTRACT account with totalEquity="" and coin list
+        engine.client.get_wallet_balance = AsyncMock(
+            return_value={
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "accountType": "CONTRACT",
+                            "totalEquity": "",
+                            "coin": [{"coin": "USDT", "equity": "125.0", "walletBalance": "125.0"}],
+                        }
+                    ]
+                },
+            }
+        )
+        await engine.initialize()
+        assert engine.risk_manager.current_equity == 125.0
+
+    asyncio.run(_test())
+
+
+

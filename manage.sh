@@ -37,6 +37,7 @@ usage() {
     echo ""
     echo "Available Commands:"
     echo "  status   - Display live PnL, active positions, win rate, and circuit breakers"
+    echo "  verify   - Deep diagnostic test of Bybit API keys, IP whitelist & connectivity"
     echo "  web      - Launch the Web Admin Executive Dashboard & Installer (port 8080)"
     echo "  logs     - Stream live real-time engine execution logs"
     echo "  panic    - EMERGENCY: Cancel all open orders and market close all positions"
@@ -56,6 +57,14 @@ case "$COMMAND" in
             exit 1
         fi
         $PYTHON manage_cli.py status
+        ;;
+
+    verify|test|check)
+        if [ ! -f "$PYTHON" ]; then
+            echo -e "${RED}Error: Virtual environment not found. Run ./install.sh first.${RESET}"
+            exit 1
+        fi
+        $PYTHON manage_cli.py verify
         ;;
 
     web)

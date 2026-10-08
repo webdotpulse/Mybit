@@ -256,7 +256,11 @@ class BybitV5Client:
             await self.initialize()
 
         url = f"{self.rest_url}{path}"
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Bybit-V5-Engine/1.0.0 (Linux; x86_64)",
+            "Accept": "application/json",
+        }
         timestamp = str(int(time.time() * 1000))
 
         payload_str = ""
@@ -294,10 +298,50 @@ class BybitV5Client:
                 method, url, headers=headers, data=body_json_str
             ) as response:
                 latency_ms = (time.perf_counter() - start_t) * 1000
-                res_json = await response.json()
+                status_code = response.status
+                raw_text = await response.text()
 
-                ret_code = res_json.get("retCode", -1)
-                ret_msg = res_json.get("retMsg", "Unknown")
+                res_json: Optional[Dict[str, Any]] = None
+                if raw_text and raw_text.strip():
+                    try:
+                        parsed = json.loads(raw_text)
+                        if isinstance(parsed, dict):
+                            res_json = parsed
+                    except Exception:
+                        pass
+
+                # If response could not be parsed as a JSON dictionary
+                if res_json is None:
+                    error_msg = (
+                        f"Bybit API HTTP {status_code} on {path} returned non-JSON or empty response. "
+                        f"Body: {raw_text[:300] if raw_text else '(empty)'}"
+                    )
+                    if status_code == 403:
+                        logger.error(
+                            f"{error_msg} | CloudFront/WAF 403 Forbidden. Possible causes: "
+                            "datacenter/cloud provider IP blocked by Bybit, US/restricted region IP, "
+                            "or API key lacks required permissions."
+                        )
+                    elif status_code == 401:
+                        logger.error(
+                            f"{error_msg} | 401 Unauthorized. Possible causes: "
+                            "invalid API key/secret, or system clock out of sync."
+                        )
+                    else:
+                        logger.error(error_msg)
+
+                    return {
+                        "retCode": status_code if status_code != 200 else -1,
+                        "retMsg": f"HTTP {status_code}: {raw_text[:200] if raw_text else 'Empty response'}",
+                        "result": {},
+                    }
+
+                # Safe retrieval of retCode and retMsg
+                ret_code = res_json.get("retCode")
+                if ret_code is None:
+                    ret_code = status_code if status_code != 200 else 0
+                    res_json["retCode"] = ret_code
+                ret_msg = res_json.get("retMsg", f"HTTP {status_code}")
 
                 if ret_code != 0:
                     # 10006 = rate limit hit
@@ -307,27 +351,58 @@ class BybitV5Client:
                         )
                         await asyncio.sleep(1.5)
                         return await self.request(method, path, params, data, auth_required)
-                    # 110007 = PostOnly will take liquidity (Maker-first retry signal)
-                    logger.debug(
-                        f"Bybit API retCode {ret_code}: {ret_msg} (latency: {latency_ms:.1f}ms)"
-                    )
+
+                    if ret_code == 10010:
+                        logger.error(
+                            f"Bybit API IP Whitelist Mismatch (retCode 10010): {ret_msg}. "
+                            "Your server's public IP is not in the API key's IP whitelist on Bybit."
+                        )
+                    elif ret_code in (10003, 10004, 10005, 33004):
+                        logger.error(
+                            f"Bybit API Authentication/Permission error (retCode {ret_code}): {ret_msg}. "
+                            "Ensure API key has read/write permissions for Unified Trading/Contract and Account."
+                        )
+                    else:
+                        logger.debug(
+                            f"Bybit API retCode {ret_code}: {ret_msg} (latency: {latency_ms:.1f}ms)"
+                        )
                 return res_json
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"HTTP request to {path} failed: {e}")
-            raise
+            return {
+                "retCode": -1,
+                "retMsg": f"Network exception: {e}",
+                "result": {},
+            }
 
     # =========================================================================
     # UNIFIED ACCOUNT REST ENDPOINTS
     # =========================================================================
 
     async def get_wallet_balance(self, account_type: str = "UNIFIED") -> Dict[str, Any]:
-        """Fetches total balance, margin, and equity for Unified Trading Account."""
+        """Fetches total balance, margin, and equity for Unified Trading Account (with CONTRACT fallback)."""
         res = await self.request(
             "GET",
             "/v5/account/wallet-balance",
             params={"accountType": account_type},
             auth_required=True,
         )
+        # If UNIFIED fails with non-zero retCode and UNIFIED was requested, attempt fallback to CONTRACT (Classic account)
+        if res.get("retCode") not in (0, None) and account_type == "UNIFIED":
+            logger.debug(
+                f"UTA wallet-balance returned retCode {res.get('retCode')}. Retrying with accountType='CONTRACT'..."
+            )
+            res_contract = await self.request(
+                "GET",
+                "/v5/account/wallet-balance",
+                params={"accountType": "CONTRACT"},
+                auth_required=True,
+            )
+            if res_contract.get("retCode") == 0:
+                logger.info("Successfully fetched wallet balance using Classic CONTRACT account type.")
+                return res_contract
         return res
 
     async def get_positions(
@@ -344,7 +419,7 @@ class BybitV5Client:
 
         res = await self.request("GET", "/v5/position/list", params=params, auth_required=True)
         if res.get("retCode") == 0:
-            return res.get("result", {}).get("list", [])
+            return (res.get("result") or {}).get("list") or []
         return []
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
@@ -444,7 +519,7 @@ class BybitV5Client:
 
         res = await self.request("GET", "/v5/order/realtime", params=params, auth_required=True)
         if res.get("retCode") == 0:
-            return res.get("result", {}).get("list", [])
+            return (res.get("result") or {}).get("list") or []
         return []
 
     async def set_trading_stop(
@@ -487,22 +562,25 @@ class BybitV5Client:
         }
         res = await self.request("GET", "/v5/market/kline", params=params, auth_required=False)
         if res.get("retCode") == 0:
-            raw_list = res.get("result", {}).get("list", [])
+            raw_list = (res.get("result") or {}).get("list") or []
             # Bybit returns klines newest to oldest: [startTime, open, high, low, close, volume, turnover]
             # Reverse to chronological order (oldest to newest)
             parsed = []
             for k in reversed(raw_list):
-                parsed.append(
-                    {
-                        "start": int(k[0]),
-                        "open": float(k[1]),
-                        "high": float(k[2]),
-                        "low": float(k[3]),
-                        "close": float(k[4]),
-                        "volume": float(k[5]),
-                        "turnover": float(k[6]),
-                    }
-                )
+                try:
+                    parsed.append(
+                        {
+                            "start": int(k[0]),
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5]),
+                            "turnover": float(k[6]),
+                        }
+                    )
+                except (IndexError, ValueError, TypeError):
+                    continue
             return parsed
         return []
 
@@ -633,7 +711,7 @@ class BybitV5Client:
             ob = self.orderbooks.get(symbol)
             if ob:
                 msg_type = data.get("type", "")
-                depth_data = data.get("data", {})
+                depth_data = data.get("data") or {}
                 if msg_type == "snapshot":
                     ob.apply_snapshot(depth_data)
                 elif msg_type == "delta":
@@ -644,7 +722,7 @@ class BybitV5Client:
             parts = topic.split(".")
             interval = parts[1]
             symbol = parts[2]
-            kline_list = data.get("data", [])
+            kline_list = data.get("data") or []
             for k in kline_list:
                 for cb in self.kline_callbacks:
                     asyncio.create_task(cb(symbol, interval, k))
@@ -653,7 +731,7 @@ class BybitV5Client:
         """Routes private execution, order, position, and wallet updates."""
         data = json.loads(raw_msg)
         topic = data.get("topic", "")
-        payload = data.get("data", [])
+        payload = data.get("data") or []
 
         if topic == "execution":
             for item in payload:

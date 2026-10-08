@@ -244,6 +244,112 @@ async def execute_panic_async() -> None:
         await client.close()
 
 
+async def verify_api_connectivity_async() -> None:
+    """Performs deep diagnostic check of Bybit credentials, IP whitelist, and endpoints."""
+    console.print(
+        Panel(
+            "[bold cyan]BYBIT V5 API DIAGNOSTIC & CONNECTIVITY CHECK[/bold cyan]\n"
+            "[dim]Validates encrypted secrets, outbound IP whitelist, REST latency, and account balances.[/dim]",
+            border_style="cyan",
+            padding=(0, 2),
+        )
+    )
+
+    # 1. Credentials
+    try:
+        config = load_config(BASE_DIR)
+        creds = load_credentials(BASE_DIR)
+        masked_key = creds.api_key[:4] + "..." + creds.api_key[-4:] if len(creds.api_key) > 8 else "***"
+        console.print(f"[green]✓ Encrypted credentials loaded successfully.[/green]")
+        console.print(f"  • API Key: [bold white]{masked_key}[/bold white]")
+        console.print(f"  • Environment: [magenta]{'TESTNET' if creds.testnet else 'LIVE MAINNET'}[/magenta]")
+        console.print(f"  • Mode: [cyan]{config.trading_mode.value.upper()}[/cyan]")
+    except Exception as e:
+        console.print(f"[bold red]✕ Failed to load credentials: {e}[/bold red]")
+        return
+
+    # 2. Public IP detection
+    client = BybitV5Client(creds, config.trading_mode)
+    await client.initialize()
+
+    public_ip = "Unknown"
+    try:
+        if client.session:
+            async with client.session.get("https://api.ipify.org?format=json", timeout=3.0) as resp:
+                if resp.status == 200:
+                    ip_data = await resp.json()
+                    public_ip = ip_data.get("ip", "Unknown")
+    except Exception:
+        pass
+
+    console.print(f"  • Server Outbound IP: [bold yellow]{public_ip}[/bold yellow]")
+
+    try:
+        # 3. Public REST Connectivity
+        console.print("\n[yellow]Testing public Bybit V5 endpoint connectivity...[/yellow]")
+        t0 = time.perf_counter()
+        time_res = await client.request("GET", "/v5/market/time", auth_required=False)
+        lat = (time.perf_counter() - t0) * 1000
+        if time_res.get("retCode") == 0:
+            console.print(f"[green]✓ Public REST endpoint reachable (Latency: {lat:.1f}ms)[/green]")
+        else:
+            console.print(f"[red]✕ Public REST check failed: {time_res.get('retMsg')}[/red]")
+
+        # 4. Authenticated Wallet Query
+        console.print("[yellow]Testing authenticated Bybit V5 wallet endpoint...[/yellow]")
+        wallet_res = await client.get_wallet_balance(account_type="UNIFIED")
+        ret_code = wallet_res.get("retCode")
+        ret_msg = wallet_res.get("retMsg", "")
+
+        if ret_code == 0:
+            result_obj = wallet_res.get("result") or {}
+            item_list = result_obj.get("list") or []
+            item0 = item_list[0] if item_list else {}
+            acc_type = item0.get("accountType", "UNIFIED")
+            eq = item0.get("totalEquity") or ""
+            console.print(f"[bold green]✓ Authenticated API connection successful![/bold green]")
+            console.print(f"  • Account Type: [cyan]{acc_type}[/cyan]")
+            console.print(f"  • Live Equity: [bold white]${float(eq):,.2f}[/bold white]" if eq != "" else "  • Equity: N/A")
+            console.print("\n[bold green]STATUS: READY FOR AUTONOMOUS LIVE TRADING[/bold green]")
+        else:
+            console.print(f"[bold red]✕ Authenticated request failed with retCode {ret_code}: {ret_msg}[/bold red]")
+            if ret_code == 10010:
+                console.print(
+                    Panel(
+                        f"[bold red]ACTION REQUIRED: IP WHITELIST MISMATCH[/bold red]\n\n"
+                        f"Your Bybit API key is restricted by IP address, but this server's IP is not in the whitelist.\n\n"
+                        f"1. Open your Bybit API Key Management page: https://www.bybit.com/user/api-management\n"
+                        f"2. Edit your API key settings.\n"
+                        f"3. Add your server's public IP: [bold yellow]{public_ip}[/bold yellow]\n"
+                        f"4. Save changes and re-run [cyan]./manage.sh verify[/cyan].",
+                        border_style="red",
+                    )
+                )
+            elif ret_code in (10003, 10004, 10005, 33004):
+                console.print(
+                    Panel(
+                        "[bold red]ACTION REQUIRED: API KEY PERMISSION ISSUE[/bold red]\n\n"
+                        "Your API key does not have permission to access wallet/account or trading endpoints.\n\n"
+                        "1. Open Bybit API Management.\n"
+                        "2. Ensure permissions include: [bold green]Unified Trading[/bold green] (or Contract), and [bold green]Account / Assets[/bold green] (Read-Only or Read-Write).\n"
+                        "3. Save changes and re-run [cyan]./manage.sh verify[/cyan].",
+                        border_style="red",
+                    )
+                )
+            elif ret_code == 403 or "403" in str(ret_msg):
+                console.print(
+                    Panel(
+                        "[bold red]ACTION REQUIRED: HTTP 403 FORBIDDEN / CLOUDFRONT BLOCK[/bold red]\n\n"
+                        "Bybit or Amazon CloudFront CDN is blocking requests from this server's hosting provider or region.\n\n"
+                        "• Ensure this VPS is not hosted in a restricted jurisdiction (e.g. US).\n"
+                        "• If your hosting provider's IP range is blocked by Bybit, consider using a proxy or server in an allowed jurisdiction (e.g. Germany, Singapore, Tokyo, UK).",
+                        border_style="red",
+                    )
+                )
+    finally:
+        await client.close()
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         render_status()
@@ -252,6 +358,8 @@ def main() -> None:
     cmd = sys.argv[1].lower()
     if cmd == "status":
         render_status()
+    elif cmd in ("verify", "test", "check"):
+        asyncio.run(verify_api_connectivity_async())
     elif cmd == "panic":
         asyncio.run(execute_panic_async())
     else:

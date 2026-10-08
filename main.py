@@ -138,19 +138,50 @@ class TradingEngine:
         await self.telegram.initialize()
 
         # 1. Fetch initial wallet balance and auto-adapt parameters to available funds
-        wallet_res = await self.client.get_wallet_balance()
+        wallet_res = {}
+        try:
+            wallet_res = await self.client.get_wallet_balance() or {}
+        except Exception as e:
+            logger.error(f"Error fetching initial wallet balance: {e}")
+
+        total_equity: Optional[float] = None
         if wallet_res.get("retCode") == 0:
-            total_equity = float(
-                wallet_res.get("result", {})
-                .get("list", [{}])[0]
-                .get("totalEquity", self.config.risk.allocated_capital_usd)
-            )
+            result_obj = wallet_res.get("result") or {}
+            item_list = result_obj.get("list") or []
+            if item_list:
+                item0 = item_list[0] or {}
+                # 1. Check UTA totalEquity
+                raw_equity = item0.get("totalEquity")
+                if raw_equity not in (None, ""):
+                    try:
+                        val = float(raw_equity)
+                        if val > 0:
+                            total_equity = val
+                    except (ValueError, TypeError):
+                        pass
+
+                # 2. Check coin breakdown (for Classic CONTRACT accounts)
+                if total_equity is None:
+                    for coin_info in (item0.get("coin") or []):
+                        if coin_info.get("coin") in ("USDT", "USDC"):
+                            c_eq = coin_info.get("equity") or coin_info.get("walletBalance")
+                            if c_eq not in (None, ""):
+                                try:
+                                    val = float(c_eq)
+                                    if val > 0:
+                                        total_equity = val
+                                        break
+                                except (ValueError, TypeError):
+                                    pass
+
+        if total_equity is not None:
             self.risk_manager.update_wallet_balance(total_equity)
-            logger.info(f"Connected to Bybit UTA. Current Account Equity: ${total_equity:,.2f}")
+            logger.info(f"Connected to Bybit account. Current Equity: ${total_equity:,.2f}")
             await self.apply_capital_tier(total_equity, force=True)
         else:
+            ret_msg = wallet_res.get("retMsg", "No balance returned")
             logger.warning(
-                f"Could not fetch wallet balance: {wallet_res.get('retMsg')}. "
+                f"Could not fetch live wallet balance ({ret_msg}). "
                 f"Using allocated capital default (${self.config.risk.allocated_capital_usd:,.2f})."
             )
             await self.apply_capital_tier(self.config.risk.allocated_capital_usd, force=True)
@@ -378,7 +409,7 @@ class TradingEngine:
                     stop_loss=sig.sl_price,
                 )
         elif ret_code == 0:
-            order_id = res.get("result", {}).get("orderId", "")
+            order_id = (res.get("result") or {}).get("orderId", "")
             self._pending_orders[order_id] = {
                 "symbol": sig.symbol,
                 "side": sig.side,
