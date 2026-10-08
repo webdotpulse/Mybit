@@ -22,6 +22,24 @@ from config import AppConfig, RiskConfig
 logger = logging.getLogger("risk_manager")
 
 
+def _to_float(val: Any, default: float = 0.0) -> float:
+    if val in (None, "", "null", "None"):
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _to_int(val: Any, default: int = 1) -> int:
+    if val in (None, "", "null", "None"):
+        return default
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
+
+
 @dataclass
 class Position:
     symbol: str
@@ -190,7 +208,7 @@ class RiskManager:
             current_symbols = set()
 
             for p in raw_positions:
-                size = float(p.get("size", 0.0))
+                size = _to_float(p.get("size"))
                 symbol = p.get("symbol", "")
                 if size > 0:
                     current_symbols.add(symbol)
@@ -198,13 +216,13 @@ class RiskManager:
                         symbol=symbol,
                         side=p.get("side", ""),
                         size=size,
-                        entry_price=float(p.get("avgPrice", 0.0)),
-                        mark_price=float(p.get("markPrice", 0.0)),
-                        unrealised_pnl=float(p.get("unrealisedPnl", 0.0)),
-                        leverage=int(p.get("leverage", 1)),
-                        take_profit=float(p.get("takeProfit", 0.0)) or None,
-                        stop_loss=float(p.get("stopLoss", 0.0)) or None,
-                        trailing_stop=float(p.get("trailingStop", 0.0)) or None,
+                        entry_price=_to_float(p.get("avgPrice")),
+                        mark_price=_to_float(p.get("markPrice")),
+                        unrealised_pnl=_to_float(p.get("unrealisedPnl")),
+                        leverage=_to_int(p.get("leverage"), 1),
+                        take_profit=_to_float(p.get("takeProfit")) or None,
+                        stop_loss=_to_float(p.get("stopLoss")) or None,
+                        trailing_stop=_to_float(p.get("trailingStop")) or None,
                     )
                 else:
                     self.positions.pop(symbol, None)
@@ -219,7 +237,7 @@ class RiskManager:
             open_orders = await self.client.get_open_orders()
             now_ms = time.time() * 1000
             for o in open_orders:
-                created_time = float(o.get("createdTime", now_ms))
+                created_time = _to_float(o.get("createdTime"), now_ms)
                 order_id = o.get("orderId")
                 symbol = o.get("symbol")
                 # If an open limit order is older than 45 seconds without filling, cancel it

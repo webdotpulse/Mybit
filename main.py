@@ -345,6 +345,10 @@ class TradingEngine:
                     if symbol in self.risk_manager.positions:
                         continue
 
+                    # Don't submit new order if there's already an active open/pending order for this symbol
+                    if any(o.get("symbol") == symbol for o in self._pending_orders.values()):
+                        continue
+
                     # Generate signal
                     signal = self.strategy.generate_signal(symbol, ob)
                     if signal:
@@ -386,6 +390,9 @@ class TradingEngine:
             logger.debug(f"[{sig.symbol}] Order rejected by RiskManager: {reason}")
             return
 
+        tp_price = self._format_price(sig.symbol, sig.tp_price)
+        sl_price = self._format_price(sig.symbol, sig.sl_price)
+
         logger.info(
             f"⚡ Signal on {sig.symbol}: {sig.side} {qty} @ ${sig.price} "
             f"(Regime: {sig.regime.value}, TIF: {sig.time_in_force}, Notional: ${actual_notional:.2f})"
@@ -399,38 +406,55 @@ class TradingEngine:
             qty=qty,
             price=sig.price,
             time_in_force=sig.time_in_force,
-            take_profit=sig.tp_price,
-            stop_loss=sig.sl_price,
+            take_profit=tp_price,
+            stop_loss=sl_price,
         )
 
         ret_code = res.get("retCode", -1)
         ret_msg = res.get("retMsg", "Unknown")
 
-        # RetCode 110007 = PostOnly will take liquidity
-        if ret_code == 110007 and self.config.execution.maker_first:
-            logger.debug(f"[{sig.symbol}] PostOnly crossed spread. Retrying with adjusted tick...")
-            # If high conviction breakout, execute IOC limit
-            if sig.conviction >= 0.85:
-                ioc_res = await self.client.create_order(
+        # RetCode 110007 = PostOnly will take liquidity (order crossed spread)
+        if ret_code == 110007:
+            logger.info(
+                f"⚡ [{sig.symbol}] PostOnly crossed spread (retCode 110007). "
+                f"Executing Market taker order to capture {sig.regime.value} momentum..."
+            )
+            mkt_res = await self.client.create_order(
+                symbol=sig.symbol,
+                side=sig.side,
+                order_type="Market",
+                qty=qty,
+                take_profit=tp_price,
+                stop_loss=sl_price,
+            )
+            mkt_ret_code = mkt_res.get("retCode", -1)
+            if mkt_ret_code == 0:
+                order_id = (mkt_res.get("result") or {}).get("orderId", "")
+                self._pending_orders[order_id] = {
+                    "symbol": sig.symbol,
+                    "side": sig.side,
+                    "qty": qty,
+                    "price": sig.price,
+                    "placed_at": time.time(),
+                }
+                logger.info(
+                    f"✅ [{sig.symbol}] Market order executed! OrderID: {order_id} "
+                    f"({sig.side} {qty}, TP: {tp_price}, SL: {sl_price})"
+                )
+                await self.telegram.send_trade_entry(
                     symbol=sig.symbol,
                     side=sig.side,
-                    order_type="Limit",
-                    qty=qty,
                     price=sig.price,
-                    time_in_force="IOC",
-                    take_profit=sig.tp_price,
-                    stop_loss=sig.sl_price,
+                    qty=qty,
+                    tp=tp_price,
+                    sl=sl_price,
+                    regime=sig.regime.value,
                 )
-                if ioc_res.get("retCode") == 0:
-                    order_id = (ioc_res.get("result") or {}).get("orderId", "")
-                    self._pending_orders[order_id] = {
-                        "symbol": sig.symbol,
-                        "side": sig.side,
-                        "qty": qty,
-                        "price": sig.price,
-                        "placed_at": time.time(),
-                    }
-                    logger.info(f"⚡ [{sig.symbol}] High-conviction IOC taker order filled. OrderID: {order_id}")
+            else:
+                logger.warning(
+                    f"❌ [{sig.symbol}] Market fallback order failed: {mkt_res.get('retMsg')} "
+                    f"(retCode: {mkt_ret_code})"
+                )
         elif ret_code == 0:
             order_id = (res.get("result") or {}).get("orderId", "")
             self._pending_orders[order_id] = {
@@ -449,8 +473,8 @@ class TradingEngine:
                 side=sig.side,
                 price=sig.price,
                 qty=qty,
-                tp=sig.tp_price,
-                sl=sig.sl_price,
+                tp=tp_price,
+                sl=sl_price,
                 regime=sig.regime.value,
             )
         else:
@@ -458,6 +482,23 @@ class TradingEngine:
                 f"❌ [{sig.symbol}] Order rejected by Bybit (retCode {ret_code}): {ret_msg} "
                 f"| Attempted: {sig.side} {qty} @ ${sig.price} (Notional: ${actual_notional:.2f})"
             )
+
+    def _format_price(self, symbol: str, price: Optional[float]) -> Optional[float]:
+        """Rounds price to symbol tick size precision on Bybit V5."""
+        if price is None or price <= 0:
+            return None
+        sym = symbol.upper()
+        if "BTC" in sym:
+            return round(price, 1)
+        elif "ETH" in sym or "SOL" in sym:
+            return round(price, 2)
+        elif "AVAX" in sym or "LINK" in sym:
+            return round(price, 3)
+        elif "SUI" in sym or "XRP" in sym or "ADA" in sym:
+            return round(price, 4)
+        elif "DOGE" in sym:
+            return round(price, 5)
+        return round(price, 4)
 
     def _format_qty(self, symbol: str, raw_qty: float) -> float:
         """Rounds quantity to symbol lot size precision on Bybit V5."""
@@ -484,6 +525,11 @@ class TradingEngine:
             try:
                 await asyncio.sleep(10)
                 await self.risk_manager.reconcile()
+                # Expire stale pending orders from memory (>45s)
+                now_sec = time.time()
+                for oid in list(self._pending_orders.keys()):
+                    if now_sec - self._pending_orders[oid].get("placed_at", now_sec) > 45:
+                        self._pending_orders.pop(oid, None)
             except asyncio.CancelledError:
                 break
             except Exception as e:

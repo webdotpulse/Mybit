@@ -478,5 +478,58 @@ def test_micro_bootstrap_bybit_lot_and_notional_compliance():
     assert permitted, f"Expected permitted but got: {reason}"
 
 
+def test_reconciliation_empty_strings():
+    """Validates that risk_manager.reconcile handles empty string fields from Bybit without crashing."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    config = AppConfig()
+    client = BybitV5Client(
+        BybitCredentials(
+            api_key="AK_1234567890_TEST",
+            api_secret="AS_9876543210_SUPERSECRET",
+            testnet=True,
+        )
+    )
+    rm = RiskManager(config, client)
+
+    # Mock get_positions with empty string fields
+    client.get_positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "DOGEUSDT",
+                "side": "Buy",
+                "size": "100.0",
+                "avgPrice": "0.08345",
+                "markPrice": "0.08350",
+                "unrealisedPnl": "",  # Empty string from Bybit
+                "leverage": "5",
+                "takeProfit": "",    # Empty string from Bybit
+                "stopLoss": "",      # Empty string from Bybit
+                "trailingStop": "",  # Empty string from Bybit
+            }
+        ]
+    )
+    client.get_open_orders = AsyncMock(
+        return_value=[
+            {
+                "symbol": "DOGEUSDT",
+                "orderId": "ord_123",
+                "createdTime": "",   # Empty string from Bybit
+            }
+        ]
+    )
+    client.cancel_order = AsyncMock()
+
+    asyncio.run(rm.reconcile())
+
+    assert "DOGEUSDT" in rm.positions
+    pos = rm.positions["DOGEUSDT"]
+    assert pos.size == 100.0
+    assert pos.unrealised_pnl == 0.0
+    assert pos.take_profit is None
+    assert pos.stop_loss is None
+
+
+
 
 

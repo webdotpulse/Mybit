@@ -459,13 +459,17 @@ class BybitV5Client:
         if order_link_id is None:
             order_link_id = f"ms_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
+        tif = time_in_force
+        if order_type == "Market":
+            tif = "IOC"
+
         data: Dict[str, Any] = {
             "category": self.category,
             "symbol": symbol,
             "side": side,
             "orderType": order_type,
             "qty": str(qty),
-            "timeInForce": time_in_force,
+            "timeInForce": tif,
             "orderLinkId": order_link_id,
             "reduceOnly": reduce_only,
         }
@@ -475,13 +479,13 @@ class BybitV5Client:
 
         if self.category == "linear":
             data["positionIdx"] = 0  # 0 for One-Way Mode in UTA
-            if take_profit:
+            if take_profit is not None and take_profit > 0:
                 data["takeProfit"] = str(take_profit)
                 data["tpTriggerBy"] = "LastPrice"
-            if stop_loss:
+            if stop_loss is not None and stop_loss > 0:
                 data["stopLoss"] = str(stop_loss)
                 data["slTriggerBy"] = "LastPrice"
-            if take_profit or stop_loss:
+            if (take_profit and take_profit > 0) or (stop_loss and stop_loss > 0):
                 data["tpslMode"] = "Full"
 
         return await self.request("POST", "/v5/order/create", data=data, auth_required=True)
