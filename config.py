@@ -36,8 +36,86 @@ class BybitCredentials(BaseModel):
         return v.strip()
 
 
+class CapitalTier(str, Enum):
+    MICRO_BOOTSTRAP = "MICRO_BOOTSTRAP"  # $10 - $99 USD (e.g. $50)
+    GROWTH_SMALL = "GROWTH_SMALL"        # $100 - $999 USD
+    STANDARD = "STANDARD"                # $1,000 - $9,999 USD
+    INSTITUTIONAL = "INSTITUTIONAL"      # $10,000+ USD
+
+
+def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
+    """
+    Computes mathematically optimal risk bounds, pairs, and exposure limits
+    strictly based on the account's available funds.
+    """
+    if equity < 100.0:
+        return (
+            CapitalTier.MICRO_BOOTSTRAP,
+            {
+                "symbols": ["SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+                "max_open_positions": 1,
+                "max_daily_risk_pct": 5.0,  # 5% gives breathing room on micro accounts
+                "min_position_equity_pct": 1.0,
+                "max_position_equity_pct": 2.0,
+                "default_leverage": 5,
+                "auto_tuning_interval": 15,
+                "description": "Micro/Bootstrap Tier ($10 - $99). Low-notional altcoins, max 1 position, 5% daily risk."
+            }
+        )
+    elif equity < 1000.0:
+        return (
+            CapitalTier.GROWTH_SMALL,
+            {
+                "symbols": ["ETHUSDT", "SOLUSDT", "SUIUSDT", "DOGEUSDT"],
+                "max_open_positions": 2,
+                "max_daily_risk_pct": 3.5,
+                "min_position_equity_pct": 0.75,
+                "max_position_equity_pct": 1.5,
+                "default_leverage": 5,
+                "auto_tuning_interval": 20,
+                "description": "Growth Tier ($100 - $999). Broad liquid pairs, max 2 concurrent positions, 3.5% daily risk."
+            }
+        )
+    elif equity < 10000.0:
+        return (
+            CapitalTier.STANDARD,
+            {
+                "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                "max_open_positions": 3,
+                "max_daily_risk_pct": 2.5,
+                "min_position_equity_pct": 0.5,
+                "max_position_equity_pct": 1.5,
+                "default_leverage": 5,
+                "auto_tuning_interval": 20,
+                "description": "Standard Quantitative Tier ($1,000 - $9,999). Major bluechips, max 3 positions, 2.5% daily risk."
+            }
+        )
+    else:
+        return (
+            CapitalTier.INSTITUTIONAL,
+            {
+                "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT"],
+                "max_open_positions": 4,
+                "max_daily_risk_pct": 2.0,
+                "min_position_equity_pct": 0.5,
+                "max_position_equity_pct": 1.0,
+                "default_leverage": 3,
+                "auto_tuning_interval": 25,
+                "description": "Institutional Tier ($10,000+). Major pairs, 4 positions, conservative 2.0% daily risk, 3x leverage."
+            }
+        )
+
+
 class RiskConfig(BaseModel):
     """Mission-Critical Risk Management and Capital Protection Limits."""
+    auto_tier_by_equity: bool = Field(
+        default=True,
+        description="Automatically adapt symbols, risk bounds, and lot sizes based on live available funds"
+    )
+    current_tier: CapitalTier = Field(
+        default=CapitalTier.STANDARD,
+        description="Currently active dynamic capital tier"
+    )
     allocated_capital_usd: float = Field(
         default=1000.0,
         gt=0,

@@ -256,3 +256,38 @@ def test_trade_journal_and_autotuner():
         res = tuner.evaluate_and_tune()
         assert res is not None
         assert res["new_tp"] > 1.2
+
+
+def test_auto_capital_tier_by_equity():
+    """Verifies that available funds dynamically auto-configure risk, pairs, and limits."""
+    from config import CapitalTier, get_tier_for_equity
+
+    # 1. Test Micro/Bootstrap Tier ($50 USD balance)
+    tier_50, cfg_50 = get_tier_for_equity(50.0)
+    assert tier_50 == CapitalTier.MICRO_BOOTSTRAP
+    assert "BTCUSDT" not in cfg_50["symbols"]  # BTC excluded due to high min-lot
+    assert "SOLUSDT" in cfg_50["symbols"]
+    assert cfg_50["max_open_positions"] == 1
+    assert cfg_50["max_daily_risk_pct"] == 5.0
+    assert cfg_50["default_leverage"] == 5
+
+    # 2. Test Small/Growth Tier ($250 USD balance)
+    tier_250, cfg_250 = get_tier_for_equity(250.0)
+    assert tier_250 == CapitalTier.GROWTH_SMALL
+    assert cfg_250["max_open_positions"] == 2
+    assert cfg_250["max_daily_risk_pct"] == 3.5
+
+    # 3. Test Standard Tier ($2,500 USD balance)
+    tier_2500, cfg_2500 = get_tier_for_equity(2500.0)
+    assert tier_2500 == CapitalTier.STANDARD
+    assert "BTCUSDT" in cfg_2500["symbols"]
+    assert cfg_2500["max_open_positions"] == 3
+    assert cfg_2500["max_daily_risk_pct"] == 2.5
+
+    # 4. Test Institutional Tier ($25,000 USD balance)
+    tier_25k, cfg_25k = get_tier_for_equity(25000.0)
+    assert tier_25k == CapitalTier.INSTITUTIONAL
+    assert cfg_25k["max_open_positions"] == 4
+    assert cfg_25k["max_daily_risk_pct"] == 2.0
+    assert cfg_25k["default_leverage"] == 3
+

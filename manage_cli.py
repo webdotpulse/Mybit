@@ -77,11 +77,22 @@ def render_status() -> None:
         "High Water Mark:",
         f"${hwm:,.2f}",
     )
+    raw_tier = data.get("capital_tier") or getattr(config.risk, "current_tier", "STANDARD")
+    tier_name = raw_tier.value if hasattr(raw_tier, "value") else str(raw_tier).replace("CapitalTier.", "")
+    auto_active = data.get("auto_tier_enabled", config.risk.auto_tier_by_equity)
+    tier_display = f"[bold cyan]{tier_name}[/bold cyan]" + (" [green](Auto-Config)[/green]" if auto_active else "")
+
     acc_table.add_row(
         "Trading Mode:",
         f"[cyan]{data.get('trading_mode', config.trading_mode.value).upper()}[/cyan]",
         "Daily Drawdown:",
         f"[{'red' if drawdown >= 2.0 else 'green'}]{drawdown:.2f}% (Limit: {config.risk.max_daily_risk_pct}%)[/{'red' if drawdown >= 2.0 else 'green'}]",
+    )
+    acc_table.add_row(
+        "Capital Tier:",
+        tier_display,
+        "Active Pairs:",
+        f"[bold white]{', '.join(data.get('symbols', config.strategy.symbols))}[/bold white]",
     )
 
     console.print(Panel(acc_table, title="Account & Risk Overview", border_style="blue"))

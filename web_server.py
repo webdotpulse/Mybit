@@ -17,6 +17,7 @@ from config import (
     AppConfig,
     BybitCredentials,
     TradingMode,
+    get_tier_for_equity,
     load_config,
     save_config,
     save_credentials,
@@ -52,9 +53,14 @@ async def handle_api_status(request: web.Request) -> web.Response:
 
     # Default fallback data if engine hasn't written status file yet
     config = load_config(BASE_DIR)
+    tier, tier_cfg = get_tier_for_equity(config.risk.allocated_capital_usd)
     default_status = {
         "status": "AUTONOMOUS_RUNNING",
         "equity": config.risk.allocated_capital_usd,
+        "capital_tier": tier.value,
+        "tier_description": tier_cfg["description"],
+        "auto_tier_enabled": config.risk.auto_tier_by_equity,
+        "symbols": tier_cfg["symbols"],
         "high_water_mark": config.risk.allocated_capital_usd,
         "daily_drawdown_pct": 0.0,
         "testnet": True,

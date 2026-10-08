@@ -85,7 +85,12 @@ async function fetchStatus() {
 }
 
 function renderDashboard() {
-  // KPIs
+  // KPIs & Active Capital Tier
+  const tierTag = document.getElementById('tier-tag');
+  if (tierTag && engineData.capital_tier) {
+    tierTag.innerText = `TIER: ${engineData.capital_tier} (AUTO)`;
+  }
+
   document.getElementById('kpi-equity').innerText = `$${engineData.equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
   document.getElementById('kpi-hwm').innerText = `$${engineData.high_water_mark.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
   

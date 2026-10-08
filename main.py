@@ -19,9 +19,17 @@ from typing import Any, Dict, Optional
 from rich.logging import RichHandler
 
 from bybit_client import BybitV5Client
-from config import AppConfig, BybitCredentials, load_config, load_credentials
+from config import (
+    AppConfig,
+    BybitCredentials,
+    CapitalTier,
+    get_tier_for_equity,
+    load_config,
+    load_credentials,
+    save_config,
+)
 from risk_manager import Position, RiskManager
-from strategy import MarketRegime, Signal, StrategyEngine
+from strategy import MarketRegime, Signal, StrategyEngine, TimeframeSeries
 from telegram_notifier import TelegramNotifier
 from trade_journal import ParameterAutoTuner, TradeJournal, TradeRecord
 
@@ -58,20 +66,80 @@ class TradingEngine:
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
         self.status_file = self.config.data_dir / "engine_status.json"
 
+    async def apply_capital_tier(self, total_equity: float, force: bool = False) -> None:
+        """
+        Dynamically adapts trading pairs, position limits, daily risk,
+        and lot sizing based strictly on live available funds.
+        """
+        if not self.config.risk.auto_tier_by_equity:
+            return
+
+        tier, tier_cfg = get_tier_for_equity(total_equity)
+        current_tier = getattr(self.config.risk, "current_tier", None)
+
+        if tier == current_tier and not force:
+            return
+
+        prev_tier_name = current_tier.value if current_tier else "INITIAL"
+        self.config.risk.current_tier = tier
+        self.config.risk.allocated_capital_usd = total_equity
+        self.config.risk.max_daily_risk_pct = tier_cfg["max_daily_risk_pct"]
+        self.config.risk.max_open_positions = tier_cfg["max_open_positions"]
+        self.config.risk.min_position_equity_pct = tier_cfg["min_position_equity_pct"]
+        self.config.risk.max_position_equity_pct = tier_cfg["max_position_equity_pct"]
+        self.config.risk.default_leverage = tier_cfg["default_leverage"]
+        self.config.strategy.auto_tuning_trade_interval = tier_cfg["auto_tuning_interval"]
+        self.config.strategy.symbols = tier_cfg["symbols"]
+
+        logger.info(
+            f"⚡ [AUTO-CONFIG] Detected Available Funds: ${total_equity:,.2f} USD\n"
+            f"  • Capital Tier Transition: {prev_tier_name} -> {tier.value}\n"
+            f"  • Description: {tier_cfg['description']}\n"
+            f"  • Active Pairs: {', '.join(tier_cfg['symbols'])}\n"
+            f"  • Max Concurrent Positions: {tier_cfg['max_open_positions']}\n"
+            f"  • Max Daily Risk: {tier_cfg['max_daily_risk_pct']}%\n"
+            f"  • Kelly Position Sizing: {tier_cfg['min_position_equity_pct']}% - {tier_cfg['max_position_equity_pct']}%\n"
+            f"  • Default Leverage: {tier_cfg['default_leverage']}x"
+        )
+
+        # Ensure all tier symbols are initialized in the strategy series and subscribed
+        for symbol in tier_cfg["symbols"]:
+            if symbol not in self.strategy.series:
+                self.strategy.series[symbol] = {
+                    tf: TimeframeSeries(symbol, tf) for tf in self.config.strategy.timeframes
+                }
+                for tf in self.config.strategy.timeframes:
+                    klines = await self.client.get_klines(symbol=symbol, interval=tf, limit=100)
+                    for k in klines:
+                        self.strategy.update_kline(symbol, tf, k)
+                self.client.subscribe_orderbook(symbol)
+                for tf in self.config.strategy.timeframes:
+                    self.client.subscribe_kline(symbol, tf)
+            if self.config.trading_mode.value == "linear":
+                await self.client.set_leverage(symbol, tier_cfg["default_leverage"])
+
+        # Persist updated configuration
+        save_config(self.config)
+
+        if self._running:
+            await self.telegram.send_message(
+                f"⚡ *Autonomous Capital Tier Updated: {tier.value}*\n"
+                f"• *Detected Balance*: `${total_equity:,.2f}`\n"
+                f"• *Active Pairs*: `{', '.join(tier_cfg['symbols'])}`\n"
+                f"• *Max Positions*: `{tier_cfg['max_open_positions']}`\n"
+                f"• *Daily Risk Limit*: `{tier_cfg['max_daily_risk_pct']}%`\n"
+                f"• *Leverage*: `{tier_cfg['default_leverage']}x`"
+            )
+
     async def initialize(self) -> None:
         """Bootstraps connection pools, historical klines, and active state."""
         logger.info("Initializing Bybit V5 Autonomous Engine...")
         await self.client.initialize()
         await self.telegram.initialize()
 
-        # 1. Fetch initial wallet balance
+        # 1. Fetch initial wallet balance and auto-adapt parameters to available funds
         wallet_res = await self.client.get_wallet_balance()
         if wallet_res.get("retCode") == 0:
-            coin_list = (
-                wallet_res.get("result", {})
-                .get("list", [{}])[0]
-                .get("coin", [])
-            )
             total_equity = float(
                 wallet_res.get("result", {})
                 .get("list", [{}])[0]
@@ -79,11 +147,13 @@ class TradingEngine:
             )
             self.risk_manager.update_wallet_balance(total_equity)
             logger.info(f"Connected to Bybit UTA. Current Account Equity: ${total_equity:,.2f}")
+            await self.apply_capital_tier(total_equity, force=True)
         else:
             logger.warning(
                 f"Could not fetch wallet balance: {wallet_res.get('retMsg')}. "
                 f"Using allocated capital default (${self.config.risk.allocated_capital_usd:,.2f})."
             )
+            await self.apply_capital_tier(self.config.risk.allocated_capital_usd, force=True)
 
         # 2. Configure leverage for linear perpetuals
         if self.config.trading_mode.value == "linear":
@@ -218,11 +288,12 @@ class TradingEngine:
             self._pending_orders.pop(order_id, None)
 
     async def _on_wallet_update(self, wallet_data: Dict[str, Any]) -> None:
-        """Updates equity in real-time from WebSocket wallet stream."""
+        """Updates equity in real-time from WebSocket wallet stream and auto-adapts tier."""
         try:
             total_equity = float(wallet_data.get("totalEquity", 0.0))
             if total_equity > 0:
                 self.risk_manager.update_wallet_balance(total_equity)
+                await self.apply_capital_tier(total_equity)
         except Exception as e:
             logger.debug(f"Wallet stream parse error: {e}")
 
@@ -386,6 +457,10 @@ class TradingEngine:
             "trading_mode": self.config.trading_mode.value,
             "testnet": self.creds.testnet,
             "equity": round(self.risk_manager.current_equity, 2),
+            "capital_tier": self.config.risk.current_tier.value,
+            "auto_tier_enabled": self.config.risk.auto_tier_by_equity,
+            "symbols": self.config.strategy.symbols,
+            "max_open_positions": self.config.risk.max_open_positions,
             "high_water_mark": round(self.risk_manager.high_water_mark, 2),
             "daily_drawdown_pct": round(
                 (
