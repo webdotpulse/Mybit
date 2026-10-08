@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 from bybit_client import BybitV5Client  # noqa: E402
-from config import load_config, load_credentials  # noqa: E402
+from config import load_config, load_credentials, save_credentials  # noqa: E402
 from trade_journal import TradeJournal  # noqa: E402
 
 console = Console()
@@ -313,7 +313,42 @@ async def verify_api_connectivity_async() -> None:
             console.print("\n[bold green]STATUS: READY FOR AUTONOMOUS LIVE TRADING[/bold green]")
         else:
             console.print(f"[bold red]✕ Authenticated request failed with retCode {ret_code}: {ret_msg}[/bold red]")
-            if ret_code == 10010:
+            if ret_code in (10003, 401) or "10003" in str(ret_msg):
+                alt_testnet = not creds.testnet
+                alt_env_name = "TESTNET" if alt_testnet else "LIVE MAINNET"
+                alt_creds = creds.model_copy(update={"testnet": alt_testnet})
+                alt_client = BybitV5Client(alt_creds, config.trading_mode)
+                await alt_client.initialize()
+                alt_res = await alt_client.get_wallet_balance(account_type="UNIFIED")
+                await alt_client.close()
+                alt_code = alt_res.get("retCode")
+                if alt_code not in (10003, 401):
+                    # The other environment recognized the key!
+                    console.print(
+                        Panel(
+                            f"[bold red]⚡ ENVIRONMENT MISMATCH DETECTED![/bold red]\n\n"
+                            f"Your API key was rejected by [bold magenta]{'TESTNET' if creds.testnet else 'LIVE MAINNET'}[/bold magenta] (retCode 10003: API key is invalid),\n"
+                            f"but it was recognized by [bold green]{alt_env_name}[/bold green]!\n\n"
+                            f"To switch your configuration to {alt_env_name}, run:\n"
+                            f"  [bold cyan]./manage.sh {'testnet' if alt_testnet else 'mainnet'}[/bold cyan]\n"
+                            f"  [bold cyan]./manage.sh restart[/bold cyan]",
+                            border_style="yellow",
+                        )
+                    )
+                else:
+                    console.print(
+                        Panel(
+                            "[bold red]ACTION REQUIRED: API KEY INVALID / RECHECK CREDENTIALS[/bold red]\n\n"
+                            "Bybit returned 'API key is invalid'. Common causes:\n"
+                            "1. Typo in API Key or API Secret when running setup.\n"
+                            "2. The API key was deleted or regenerated in Bybit API Management.\n"
+                            "3. You can update your credentials anytime by running:\n"
+                            "   [cyan]./manage.sh web[/cyan] (and opening http://localhost:8080/setup.html)\n"
+                            "   or [cyan]python3 installer.py[/cyan]",
+                            border_style="red",
+                        )
+                    )
+            elif ret_code == 10010:
                 console.print(
                     Panel(
                         f"[bold red]ACTION REQUIRED: IP WHITELIST MISMATCH[/bold red]\n\n"
@@ -325,7 +360,7 @@ async def verify_api_connectivity_async() -> None:
                         border_style="red",
                     )
                 )
-            elif ret_code in (10003, 10004, 10005, 33004):
+            elif ret_code in (10004, 10005, 33004):
                 console.print(
                     Panel(
                         "[bold red]ACTION REQUIRED: API KEY PERMISSION ISSUE[/bold red]\n\n"
@@ -350,6 +385,25 @@ async def verify_api_connectivity_async() -> None:
         await client.close()
 
 
+def switch_environment(testnet: bool) -> None:
+    """Toggles environment between Testnet and Live Mainnet without re-entering keys."""
+    try:
+        creds = load_credentials(BASE_DIR)
+        updated = creds.model_copy(update={"testnet": testnet})
+        save_credentials(updated, BASE_DIR)
+        env_label = "TESTNET (api-testnet.bybit.com)" if testnet else "LIVE MAINNET (api.bybit.com)"
+        console.print(
+            Panel(
+                f"[bold green]✓ Configuration updated to {env_label}[/bold green]\n\n"
+                f"Next step: apply changes to the trading daemon by running:\n"
+                f"  [cyan]./manage.sh restart[/cyan]",
+                border_style="green",
+            )
+        )
+    except Exception as e:
+        console.print(f"[bold red]✕ Failed to switch environment: {e}[/bold red]")
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         render_status()
@@ -360,6 +414,10 @@ def main() -> None:
         render_status()
     elif cmd in ("verify", "test", "check"):
         asyncio.run(verify_api_connectivity_async())
+    elif cmd in ("mainnet", "live", "prod"):
+        switch_environment(testnet=False)
+    elif cmd in ("testnet", "demo"):
+        switch_environment(testnet=True)
     elif cmd == "panic":
         asyncio.run(execute_panic_async())
     else:
