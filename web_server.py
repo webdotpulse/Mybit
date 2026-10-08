@@ -19,6 +19,7 @@ from config import (
     TradingMode,
     get_tier_for_equity,
     load_config,
+    load_credentials,
     save_config,
     save_credentials,
 )
@@ -54,6 +55,13 @@ async def handle_api_status(request: web.Request) -> web.Response:
     # Default fallback data if engine hasn't written status file yet
     config = load_config(BASE_DIR)
     tier, tier_cfg = get_tier_for_equity(config.risk.allocated_capital_usd)
+    is_testnet = False
+    try:
+        creds = load_credentials(BASE_DIR)
+        is_testnet = bool(creds.testnet)
+    except Exception:
+        pass
+
     default_status = {
         "status": "AUTONOMOUS_RUNNING",
         "equity": config.risk.allocated_capital_usd,
@@ -63,7 +71,7 @@ async def handle_api_status(request: web.Request) -> web.Response:
         "symbols": tier_cfg["symbols"],
         "high_water_mark": config.risk.allocated_capital_usd,
         "daily_drawdown_pct": 0.0,
-        "testnet": True,
+        "testnet": is_testnet,
         "trading_mode": config.trading_mode.value,
         "circuit_breakers": {
             "daily_drawdown_tripped": False,

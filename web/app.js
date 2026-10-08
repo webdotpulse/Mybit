@@ -10,7 +10,7 @@ let engineData = {
   equity: 1048.25,
   high_water_mark: 1052.10,
   daily_drawdown_pct: 0.36,
-  testnet: true,
+  testnet: false,
   trading_mode: "linear",
   circuit_breakers: {
     daily_drawdown_tripped: false,
@@ -74,7 +74,7 @@ async function fetchStatus() {
     const res = await fetch('/api/status');
     if (res.ok) {
       const data = await res.json();
-      if (data && data.equity) {
+      if (data && (data.equity !== undefined || data.status !== undefined)) {
         engineData = { ...engineData, ...data };
       }
     }
@@ -89,6 +89,42 @@ function renderDashboard() {
   const tierTag = document.getElementById('tier-tag');
   if (tierTag && engineData.capital_tier) {
     tierTag.innerText = `TIER: ${engineData.capital_tier} (AUTO)`;
+  }
+
+  // Dynamic Live / Testnet Environment Badge
+  const envTag = document.getElementById('env-tag');
+  if (envTag) {
+    const isTestnet = Boolean(engineData.testnet);
+    if (isTestnet) {
+      envTag.innerText = "TESTNET";
+      envTag.style.background = "rgba(138, 43, 226, 0.15)";
+      envTag.style.color = "#d094ff";
+      envTag.style.borderColor = "rgba(138, 43, 226, 0.4)";
+    } else {
+      envTag.innerText = "LIVE MAINNET";
+      envTag.style.background = "rgba(0, 230, 118, 0.15)";
+      envTag.style.color = "var(--accent-emerald)";
+      envTag.style.borderColor = "rgba(0, 230, 118, 0.4)";
+    }
+  }
+
+  // Engine Running / Panic Status Badge
+  const statusBadge = document.getElementById('engine-status-badge');
+  const statusText = document.getElementById('engine-status-text');
+  if (statusText && engineData.status) {
+    if (engineData.status.includes('PANIC') || engineData.status.includes('HALT')) {
+      statusText.innerText = 'PANIC HALTED';
+      if (statusBadge) {
+        statusBadge.style.borderColor = 'var(--accent-rose)';
+        statusBadge.style.color = 'var(--accent-rose)';
+      }
+    } else {
+      statusText.innerText = 'AUTONOMOUS RUNNING';
+      if (statusBadge) {
+        statusBadge.style.borderColor = 'rgba(0, 230, 118, 0.4)';
+        statusBadge.style.color = 'var(--accent-emerald)';
+      }
+    }
   }
 
   document.getElementById('kpi-equity').innerText = `$${engineData.equity.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
