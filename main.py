@@ -326,14 +326,17 @@ class TradingEngine:
             )
 
     def _format_qty(self, symbol: str, raw_qty: float) -> float:
-        """Rounds quantity to symbol lot size precision."""
-        if "BTC" in symbol:
+        """Rounds quantity to symbol lot size precision on Bybit V5."""
+        sym = symbol.upper()
+        if "BTC" in sym:
             return round(raw_qty, 3)
-        elif "ETH" in symbol:
+        elif "ETH" in sym:
             return round(raw_qty, 2)
-        elif "SOL" in symbol:
+        elif "SOL" in sym or "SUI" in sym or "AVAX" in sym or "LINK" in sym:
             return round(raw_qty, 1)
-        return round(raw_qty, 1)
+        elif "DOGE" in sym or "XRP" in sym or "ADA" in sym or "TRX" in sym:
+            return float(int(raw_qty))
+        return round(raw_qty, 2)
 
     async def _reconciliation_loop(self) -> None:
         """Active 10-Second State Reconciliation Loop."""
