@@ -276,7 +276,7 @@ def test_auto_capital_tier_by_equity():
     # 2. Test Small/Growth Tier ($250 USD balance)
     tier_250, cfg_250 = get_tier_for_equity(250.0)
     assert tier_250 == CapitalTier.GROWTH_SMALL
-    assert cfg_250["max_open_positions"] == 2
+    assert cfg_250["max_open_positions"] == 3
     assert cfg_250["max_daily_risk_pct"] == 3.5
 
     # 3. Test Standard Tier ($2,500 USD balance)

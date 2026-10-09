@@ -75,7 +75,7 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
                 "max_position_equity_pct": 20.0,
                 "default_leverage": 10,
                 "auto_tuning_interval": 20,
-                "description": f"Growth Tier (${int(equity)} USD). Highly liquid pairs, max 2 concurrent positions, 3.5% daily risk."
+                "description": f"Growth Tier (${int(equity)} USD). Highly liquid pairs, max 3 concurrent positions, 3.5% daily risk."
             }
         )
     elif equity < 10000.0:
