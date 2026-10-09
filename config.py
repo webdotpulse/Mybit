@@ -69,7 +69,7 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
             CapitalTier.GROWTH_SMALL,
             {
                 "symbols": active_symbols,
-                "max_open_positions": 2,
+                "max_open_positions": 3,
                 "max_daily_risk_pct": 3.5,
                 "min_position_equity_pct": 12.0,
                 "max_position_equity_pct": 20.0,
