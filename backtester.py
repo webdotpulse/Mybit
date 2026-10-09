@@ -254,44 +254,41 @@ class QuantitativeBacktester:
                 qty = open_pos["qty"]
                 notional = qty * entry_px
 
-                # A. Check Breakeven Advancement
-                be_trigger = self.config.execution.breakeven_atr_trigger
-                be_buffer = entry_px * (self.config.execution.breakeven_buffer_bps / 10000.0)
-
-                if not be_set and be_trigger > 0:
-                    if side == "Buy" and bar.high >= (entry_px + be_trigger * atr):
-                        open_pos["sl_price"] = entry_px + be_buffer
-                        open_pos["breakeven_set"] = True
-                        sl_px = open_pos["sl_price"]
-                    elif side == "Sell" and bar.low <= (entry_px - be_trigger * atr):
-                        open_pos["sl_price"] = entry_px - be_buffer
-                        open_pos["breakeven_set"] = True
-                        sl_px = open_pos["sl_price"]
-
-                # B. Check Exit Triggers against Bar High/Low
+                # A. Check Exit Triggers against Bar High/Low (prior to same-bar breakeven)
                 exit_occurred = False
                 exit_price = 0.0
                 exit_reason = ""
 
                 if side == "Buy":
-                    # Check Stop Loss first (conservative evaluation)
-                    if bar.low <= sl_px:
-                        exit_price = sl_px * (1.0 - self.slippage_pct)
-                        exit_reason = "BREAKEVEN" if open_pos["breakeven_set"] else "SL"
-                        exit_occurred = True
-                    elif bar.high >= tp_px:
+                    # Check TP and SL with realistic intraday sequence
+                    if bar.high >= tp_px:
                         exit_price = tp_px * (1.0 - self.slippage_pct)
                         exit_reason = "TP"
                         exit_occurred = True
-                else:  # Sell / Short
-                    if bar.high >= sl_px:
-                        exit_price = sl_px * (1.0 + self.slippage_pct)
+                    elif bar.low <= sl_px:
+                        exit_price = sl_px * (1.0 - self.slippage_pct)
                         exit_reason = "BREAKEVEN" if open_pos["breakeven_set"] else "SL"
                         exit_occurred = True
-                    elif bar.low <= tp_px:
+                else:  # Sell / Short
+                    if bar.low <= tp_px:
                         exit_price = tp_px * (1.0 + self.slippage_pct)
                         exit_reason = "TP"
                         exit_occurred = True
+                    elif bar.high >= sl_px:
+                        exit_price = sl_px * (1.0 + self.slippage_pct)
+                        exit_reason = "BREAKEVEN" if open_pos["breakeven_set"] else "SL"
+                        exit_occurred = True
+
+                # B. Advance Stop Loss to Breakeven for subsequent price action
+                be_trigger = self.config.execution.breakeven_atr_trigger
+                be_buffer = entry_px * (self.config.execution.breakeven_buffer_bps / 10000.0)
+                if not exit_occurred and not be_set and be_trigger > 0:
+                    if side == "Buy" and bar.high >= (entry_px + be_trigger * atr):
+                        open_pos["sl_price"] = entry_px + be_buffer
+                        open_pos["breakeven_set"] = True
+                    elif side == "Sell" and bar.low <= (entry_px - be_trigger * atr):
+                        open_pos["sl_price"] = entry_px - be_buffer
+                        open_pos["breakeven_set"] = True
 
                 # C. Check Stagnant Position Timeout
                 if not exit_occurred and duration_mins >= self.config.execution.stagnant_exit_mins:
@@ -313,7 +310,7 @@ class QuantitativeBacktester:
                     total_fees += (open_pos["entry_fee"] + exit_fee)
                     equity += net_trade_pnl
 
-                    strat.record_trade_result(net_trade_pnl)
+                    strat.record_trade_result(net_trade_pnl, regime=open_pos["regime"])
 
                     closed_trades.append(
                         BacktestTrade(

@@ -28,7 +28,7 @@ from config import (
 )
 from risk_manager import Position, RiskManager
 from strategy import Bar, MarketRegime, StrategyEngine, TimeframeSeries
-from trade_journal import ParameterAutoTuner, TradeJournal, TradeRecord
+from trade_journal import OnlineStrategyLearner, ParameterAutoTuner, TradeJournal, TradeRecord
 
 
 def test_config_encryption_and_permissions():
@@ -788,6 +788,185 @@ def test_breakout_tp_atr_mult():
     expected_tp_dist = round(2.5 * sig.atr, 4)
     actual_tp_dist = round(sig.tp_price - sig.price, 4)
     assert abs(actual_tp_dist - expected_tp_dist) < 0.1
+
+
+def test_online_strategy_learner():
+    """Verifies that OnlineStrategyLearner rewards wins, penalizes losses, and persists to SQLite."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "trading_journal.db"
+        journal = TradeJournal(db_path)
+        learner = journal.learner
+
+        # Initial default weights
+        init_pullback = learner.get_weight("trend_pullback")
+        assert init_pullback == 1.15
+
+        # Reward on win
+        learner.record_trade_result("TREND_PULLBACK", 0.50, {"ofi": 10.0, "r2": 0.40})
+        new_pullback = learner.get_weight("trend_pullback")
+        assert new_pullback > init_pullback
+        assert learner.get_weight("ofi_lead") > 1.05
+        assert learner.get_weight("linreg_trend") > 1.05
+
+        # Penalize on loss
+        learner.record_trade_result("TREND_PULLBACK", -0.50, {})
+        penalized_pullback = learner.get_weight("trend_pullback")
+        assert penalized_pullback < new_pullback
+
+        # Check persistence by creating a fresh learner instance pointing to same DB
+        learner2 = OnlineStrategyLearner(journal)
+        assert learner2.get_weight("trend_pullback") == penalized_pullback
+
+
+def test_advanced_indicators_rsi_linreg_bollinger():
+    """Verifies Wilder RSI, 8-period Linear Regression forecast, and Bollinger Bands calculation."""
+    tf = TimeframeSeries("BTCUSDT", "1m", max_bars=100)
+    base_t = int(time.time() * 1000) - (60 * 60 * 1000)
+
+    # Monotonically rising bars -> RSI should be high, LinReg slope positive, R^2 high
+    for i in range(40):
+        t = base_t + (i * 60 * 1000)
+        p = 50000.0 + (i * 50.0)
+        tf.add_or_update_bar(Bar(
+            timestamp=t,
+            open=p - 10.0,
+            high=p + 20.0,
+            low=p - 20.0,
+            close=p,
+            volume=5.0,
+            turnover=p * 5.0,
+        ))
+
+    rsi = tf.calculate_rsi(14)
+    assert rsi > 70.0  # Strongly overbought due to consistent rise
+
+    slope, r2, next_pred = tf.calculate_linreg(8)
+    assert slope > 0.0
+    assert r2 > 0.90  # Extremely linear trend
+    assert next_pred > tf.bars[-1].close  # Predicts higher next bar
+
+    upper, mid, lower, pct_b = tf.calculate_bollinger(20)
+    assert upper > mid > lower
+    assert pct_b > 0.80  # Price riding upper band
+
+
+def test_trend_pullback_regime_and_signal():
+    """Verifies that TREND_PULLBACK triggers when 5m is in uptrend and 1m dips to EMA21."""
+    cfg = AppConfig()
+    strat = StrategyEngine(cfg)
+
+    base_t = int(time.time() * 1000) - (120 * 60 * 1000)
+    # Seed 60 5m bars in strong bull trend
+    for i in range(60):
+        t = base_t + (i * 300 * 1000)
+        p = 50000.0 + (i * 30.0)
+        strat.update_kline("BTCUSDT", "5m", {
+            "start": t,
+            "open": p - 10.0,
+            "high": p + 25.0,
+            "low": p - 10.0,
+            "close": p,
+            "volume": 20.0,
+            "turnover": p * 20.0,
+        })
+
+    # Seed 60 1m bars where recent bars pull back to EMA21 with moderate RSI
+    for i in range(55):
+        t = base_t + ((60 * 5 - 60 + i) * 60 * 1000)
+        p = 51500.0 + (i * 5.0)
+        strat.update_kline("BTCUSDT", "1m", {
+            "start": t,
+            "open": p - 5.0,
+            "high": p + 10.0,
+            "low": p - 5.0,
+            "close": p,
+            "volume": 5.0,
+            "turnover": p * 5.0,
+        })
+    # Last 5 bars dip towards EMA21
+    for i in range(5):
+        t = base_t + ((60 * 5 - 5 + i) * 60 * 1000)
+        p = 51780.0 - (i * 20.0)
+        strat.update_kline("BTCUSDT", "1m", {
+            "start": t,
+            "open": p + 10.0,
+            "high": p + 15.0,
+            "low": p - 10.0,
+            "close": p,
+            "volume": 10.0,
+            "turnover": p * 10.0,
+        })
+
+    ob = OrderBookL2("BTCUSDT")
+    best_bid = 51700.0
+    ob.apply_snapshot({"b": [[str(best_bid), "2.0"]], "a": [["51701.0", "2.0"]], "u": 1})
+    ob.ofi = 10.0
+
+    regime, metrics = strat.classify_regime("BTCUSDT", ob)
+    assert regime in (MarketRegime.TREND_PULLBACK, MarketRegime.BULL_TREND)
+
+    sig = strat.generate_signal("BTCUSDT", ob)
+    if sig:
+        assert sig.side == "Buy"
+        assert sig.time_in_force == "PostOnly"
+        # Minimum fee-clearing buffer (35 bps)
+        assert (sig.tp_price - sig.price) >= (sig.price * 0.0035) - 0.01
+
+
+@pytest.mark.asyncio
+async def test_closed_pnl_synchronization():
+    """Verifies that TradingEngine._sync_closed_pnl reliably records true realized PnL."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base_dir = Path(tmpdir)
+        cfg = AppConfig(data_dir=base_dir, log_dir=base_dir)
+        creds = BybitCredentials(api_key="TEST_API_KEY_123", api_secret="TEST_API_SECRET_456", testnet=True)
+
+        from main import TradingEngine
+        engine = TradingEngine(cfg, creds)
+
+        # Mock BybitV5Client.get_closed_pnl
+        fake_closed_records = [
+            {
+                "symbol": "DOGEUSDT",
+                "orderId": "order_tp_123",
+                "side": "Buy",
+                "qty": "100.0",
+                "avgEntryPrice": "0.1000",
+                "avgExitPrice": "0.1020",
+                "closedPnl": "0.2000",
+                "execFee": "0.0100",
+                "orderType": "Limit",
+                "updatedTime": "1672531200000",
+            }
+        ]
+        engine.client.get_closed_pnl = AsyncMock(return_value=fake_closed_records)
+        engine.telegram.send_trade_exit = AsyncMock()
+
+        # Seed initial position context
+        engine._position_context["DOGEUSDT"] = {
+            "price": 0.1000,
+            "placed_at": 1672531190.0,
+            "regime": "TREND_PULLBACK",
+            "conviction": 0.85,
+            "atr": 0.0015,
+        }
+
+        await engine._sync_closed_pnl("DOGEUSDT")
+
+        # Verify recorded in journal
+        assert engine.journal.get_total_trade_count() == 1
+        recent = engine.journal.get_recent_trades(1)[0]
+        assert recent["symbol"] == "DOGEUSDT"
+        assert recent["realized_pnl"] == 0.20
+        assert recent["regime"] == "TREND_PULLBACK"
+
+        # Verify recorded in OnlineStrategyLearner
+        assert engine.strategy.learner.stats["trend_pullback"]["wins"] == 1
+        assert engine.strategy.learner.stats["trend_pullback"]["total_pnl"] == 0.20
+
+        # Verify duplicate sync ignores already processed order
+        await engine._sync_closed_pnl("DOGEUSDT")
+        assert engine.journal.get_total_trade_count() == 1
 
 
 

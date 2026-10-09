@@ -422,6 +422,20 @@ class BybitV5Client:
             return (res.get("result") or {}).get("list") or []
         return []
 
+    async def get_closed_pnl(
+        self,
+        symbol: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Queries historical realized closed PnL records for linear contracts."""
+        params: Dict[str, Any] = {"category": self.category, "limit": min(limit, 100)}
+        if symbol:
+            params["symbol"] = symbol
+        res = await self.request("GET", "/v5/position/closed-pnl", params=params, auth_required=True)
+        if res.get("retCode") == 0:
+            return (res.get("result") or {}).get("list") or []
+        return []
+
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Sets leverage for cross/isolated linear perpetual positions."""
         if self.category != "linear":

@@ -52,6 +52,14 @@ class TradeJournal:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self._learner: Optional[OnlineStrategyLearner] = None
+
+    @property
+    def learner(self) -> OnlineStrategyLearner:
+        """Returns the online strategy learner instance for continuous reinforcement learning."""
+        if self._learner is None:
+            self._learner = OnlineStrategyLearner(self)
+        return self._learner
 
     def _get_connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path, timeout=10.0)
@@ -102,6 +110,18 @@ class TradeJournal:
                     prev_kelly_scale REAL NOT NULL,
                     new_kelly_scale REAL NOT NULL,
                     rationale TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_learning_memory (
+                    feature_key TEXT PRIMARY KEY,
+                    weight REAL NOT NULL,
+                    wins INTEGER NOT NULL DEFAULT 0,
+                    losses INTEGER NOT NULL DEFAULT 0,
+                    total_pnl REAL NOT NULL DEFAULT 0.0,
+                    last_updated INTEGER NOT NULL
                 )
                 """
             )
@@ -313,3 +333,117 @@ class ParameterAutoTuner:
             "new_kelly": new_kelly,
             "rationale": rationale,
         }
+
+
+class OnlineStrategyLearner:
+    """
+    Online Self-Adaptive Machine Learning Engine.
+    Learns dynamically from every realized trade outcome using online reinforcement
+    weight adjustment. Persists learned weights to SQLite so intelligence is preserved
+    and evolves over time.
+    """
+
+    DEFAULT_WEIGHTS = {
+        "trend_pullback": 1.15,
+        "trend_momentum": 1.00,
+        "mean_reversion": 1.00,
+        "volatility_expansion": 0.85,
+        "ofi_lead": 1.05,
+        "rsi_divergence": 1.00,
+        "linreg_trend": 1.05,
+    }
+
+    def __init__(self, journal: TradeJournal):
+        self.journal = journal
+        self.weights: Dict[str, float] = dict(self.DEFAULT_WEIGHTS)
+        self.stats: Dict[str, Dict[str, Any]] = {}
+        self._load_memory()
+
+    def _load_memory(self) -> None:
+        try:
+            with self.journal._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT feature_key, weight, wins, losses, total_pnl FROM strategy_learning_memory"
+                )
+                rows = cursor.fetchall()
+                for k, w, wins, losses, tot_pnl in rows:
+                    self.weights[k] = float(w)
+                    self.stats[k] = {
+                        "wins": int(wins),
+                        "losses": int(losses),
+                        "total_pnl": float(tot_pnl),
+                    }
+            if rows:
+                logger.info(f"🧠 Loaded {len(rows)} learned weights from database memory.")
+        except Exception as e:
+            logger.debug(f"Failed to load learning memory, using defaults: {e}")
+
+    def record_trade_result(
+        self, regime: str, pnl: float, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Updates regime and feature weights based on realized profit or loss."""
+        keys_to_update = []
+        if regime:
+            reg_key = regime.lower()
+            if reg_key in self.weights:
+                keys_to_update.append(reg_key)
+            elif "pullback" in reg_key:
+                keys_to_update.append("trend_pullback")
+            elif "momentum" in reg_key or "trend" in reg_key:
+                keys_to_update.append("trend_momentum")
+            elif "reversion" in reg_key or "chop" in reg_key:
+                keys_to_update.append("mean_reversion")
+            elif "expansion" in reg_key:
+                keys_to_update.append("volatility_expansion")
+
+        if metadata:
+            if abs(float(metadata.get("ofi", 0.0))) > 5.0:
+                keys_to_update.append("ofi_lead")
+            if float(metadata.get("r2", 0.0)) > 0.30:
+                keys_to_update.append("linreg_trend")
+
+        now_ms = int(time.time() * 1000)
+        learning_rate = 0.05
+
+        with self.journal._get_connection() as conn:
+            cursor = conn.cursor()
+            for k in set(keys_to_update):
+                current_w = self.weights.get(k, 1.0)
+                st = self.stats.setdefault(k, {"wins": 0, "losses": 0, "total_pnl": 0.0})
+
+                if pnl > 0:
+                    st["wins"] += 1
+                    # Reward: increase weight (clamped between 0.35 and 2.20)
+                    new_w = min(2.20, round(current_w + learning_rate * min(1.0, max(0.2, pnl / 0.5)), 3))
+                else:
+                    st["losses"] += 1
+                    # Penalize underperforming feature
+                    new_w = max(0.35, round(current_w - learning_rate * min(1.0, max(0.2, abs(pnl) / 0.5)), 3))
+
+                st["total_pnl"] += pnl
+                self.weights[k] = new_w
+
+                cursor.execute(
+                    """
+                    INSERT INTO strategy_learning_memory (feature_key, weight, wins, losses, total_pnl, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(feature_key) DO UPDATE SET
+                        weight=excluded.weight,
+                        wins=excluded.wins,
+                        losses=excluded.losses,
+                        total_pnl=excluded.total_pnl,
+                        last_updated=excluded.last_updated
+                    """,
+                    (k, new_w, st["wins"], st["losses"], round(st["total_pnl"], 4), now_ms),
+                )
+            conn.commit()
+
+        logger.info(
+            f"🧠 [ONLINE LEARNER] Trade result PnL=${pnl:.2f} logged for {regime}. "
+            f"Active weights: {self.weights}"
+        )
+
+    def get_weight(self, key: str) -> float:
+        return self.weights.get(key, 1.0)
+

@@ -25,6 +25,8 @@ logger = logging.getLogger("strategy")
 class MarketRegime(str, Enum):
     BULL_TREND = "BULL_TREND"
     BEAR_TREND = "BEAR_TREND"
+    TREND_PULLBACK = "TREND_PULLBACK"
+    MEAN_REVERSION_RANGE = "MEAN_REVERSION_RANGE"
     VOLATILITY_EXPANSION = "VOLATILITY_EXPANSION"
     LOW_VOL_CHOP = "LOW_VOL_CHOP"
 
@@ -224,6 +226,74 @@ class TimeframeSeries:
 
         return adx, plus_di_list[-1], minus_di_list[-1]
 
+    def calculate_rsi(self, period: int = 14) -> float:
+        """Calculates Welles Wilder's Relative Strength Index (RSI)."""
+        closes = self.get_closes()
+        if len(closes) < period + 1:
+            return 50.0
+
+        deltas = np.diff(closes)
+        gains = np.maximum(deltas, 0.0)
+        losses = np.maximum(-deltas, 0.0)
+
+        avg_gain = float(np.mean(gains[:period]))
+        avg_loss = float(np.mean(losses[:period]))
+
+        for g, l in zip(gains[period:], losses[period:]):
+            avg_gain = (avg_gain * (period - 1) + float(g)) / period
+            avg_loss = (avg_loss * (period - 1) + float(l)) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return float(100.0 - (100.0 / (1.0 + rs)))
+
+    def calculate_linreg(self, period: int = 8) -> Tuple[float, float, float]:
+        """
+        Computes rolling linear regression on close prices.
+        Returns: (slope, r2_score, next_bar_forecast).
+        """
+        closes = self.get_closes()
+        if len(closes) < period:
+            c = float(closes[-1]) if len(closes) > 0 else 0.0
+            return 0.0, 0.0, c
+
+        y = closes[-period:]
+        x = np.arange(period)
+        cov = np.cov(x, y)[0, 1]
+        var_x = np.var(x)
+        slope = float(cov / var_x) if var_x > 0 else 0.0
+        intercept = float(np.mean(y) - slope * np.mean(x))
+        y_pred = slope * x + intercept
+
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        ss_res = float(np.sum((y - y_pred) ** 2))
+        r2 = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+        next_forecast = float(slope * period + intercept)
+
+        return slope, r2, next_forecast
+
+    def calculate_bollinger(self, period: int = 20, num_std: float = 2.0) -> Tuple[float, float, float, float]:
+        """
+        Computes Bollinger Bands and %B position.
+        Returns: (upper_band, middle_sma, lower_band, pct_b).
+        """
+        closes = self.get_closes()
+        if len(closes) < period:
+            c = float(closes[-1]) if len(closes) > 0 else 0.0
+            return c, c, c, 0.5
+
+        recent = closes[-period:]
+        sma = float(np.mean(recent))
+        std = float(np.std(recent))
+        upper = sma + num_std * std
+        lower = sma - num_std * std
+        current = float(closes[-1])
+        bandwidth = upper - lower
+        pct_b = float((current - lower) / bandwidth) if bandwidth > 0 else 0.5
+
+        return upper, sma, lower, pct_b
+
 
 
 class StrategyEngine:
@@ -232,11 +302,12 @@ class StrategyEngine:
     Computes multi-timeframe features, determines regime, and produces signals.
     """
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, learner: Optional[Any] = None):
         self.config = config
         self.strat_cfg = config.strategy
         self.exec_cfg = config.execution
         self.risk_cfg = config.risk
+        self.learner = learner  # OnlineStrategyLearner
 
         # Multi-timeframe structures: symbol -> timeframe -> TimeframeSeries
         self.series: Dict[str, Dict[str, TimeframeSeries]] = {}
@@ -248,9 +319,19 @@ class StrategyEngine:
         # Rolling win/loss memory for Kelly Criterion calculation
         self.rolling_trades: Deque[float] = collections.deque(maxlen=50)
 
-    def record_trade_result(self, pnl: float) -> None:
-        """Records realized trade PnL for dynamic Kelly fraction tuning."""
+    def record_trade_result(
+        self,
+        pnl: float,
+        regime: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Records realized trade PnL for dynamic Kelly fraction tuning and online learning."""
         self.rolling_trades.append(pnl)
+        if self.learner and regime:
+            try:
+                self.learner.record_trade_result(regime, pnl, metadata)
+            except Exception as e:
+                logger.debug(f"Online learner record error: {e}")
 
     def calculate_kelly_fraction(self) -> float:
         """
@@ -309,8 +390,10 @@ class StrategyEngine:
         orderbook: Optional[OrderBookL2] = None,
     ) -> Tuple[MarketRegime, Dict[str, float]]:
         """
-        Classifies market regime into Bull Trend, Bear Trend, Volatility Expansion, or Chop.
-        Enforces 15m macro trend alignment, ADX trend strength, and volume confirmation.
+        Classifies market regime into Bull Trend, Bear Trend, Trend Pullback,
+        Mean Reversion Range, Volatility Expansion, or Low Vol Chop.
+        Enforces multi-horizon linear regression forecasting, ADX trend strength,
+        Wilder RSI, and Bollinger Band structure.
         """
         tf_1m = self.series[symbol].get("1m")
         tf_5m = self.series[symbol].get("5m")
@@ -319,7 +402,7 @@ class StrategyEngine:
         if not tf_1m or len(tf_1m.bars) < self.strat_cfg.ema_slow:
             return MarketRegime.LOW_VOL_CHOP, {}
 
-        # 1m indicators
+        # 1m technical indicators
         ema9 = tf_1m.calculate_ema(self.strat_cfg.ema_fast)
         ema21 = tf_1m.calculate_ema(self.strat_cfg.ema_mid)
         ema50 = tf_1m.calculate_ema(self.strat_cfg.ema_slow)
@@ -332,9 +415,20 @@ class StrategyEngine:
         # ADX trend strength calculation (Wilder ADX)
         adx, plus_di, minus_di = tf_1m.calculate_adx(self.strat_cfg.atr_period)
 
+        # Advanced forecasting: RSI, Linear Regression slope, and Bollinger Bands
+        rsi_1m = tf_1m.calculate_rsi(14)
+        slope_1m, r2_1m, next_px_1m = tf_1m.calculate_linreg(8)
+        upper_bb, mid_bb, lower_bb, pct_b = tf_1m.calculate_bollinger(20)
+
         # 5m and 15m trend confirmation
         ema9_5m = tf_5m.calculate_ema(self.strat_cfg.ema_fast) if (tf_5m and len(tf_5m.bars) > 0) else ema9
         ema21_5m = tf_5m.calculate_ema(self.strat_cfg.ema_mid) if (tf_5m and len(tf_5m.bars) > 0) else ema21
+        atr_5m = tf_5m.calculate_atr(14) if (tf_5m and len(tf_5m.bars) >= 14) else 0.0
+        vwap_5m = tf_5m.calculate_vwap(30) if (tf_5m and len(tf_5m.bars) > 0) else vwap
+        slope_5m, r2_5m, _ = (
+            tf_5m.calculate_linreg(8) if (tf_5m and len(tf_5m.bars) >= 8) else (slope_1m, r2_1m, 0.0)
+        )
+
         ema50_15m = tf_15m.calculate_ema(self.strat_cfg.ema_slow) if (tf_15m and len(tf_15m.bars) > 0) else (
             tf_5m.calculate_ema(self.strat_cfg.ema_slow) if (tf_5m and len(tf_5m.bars) > 0) else ema50
         )
@@ -358,7 +452,9 @@ class StrategyEngine:
             "ema21_5m": ema21_5m,
             "ema50_15m": ema50_15m,
             "atr": atr,
+            "atr_5m": atr_5m,
             "vwap": vwap,
+            "vwap_5m": vwap_5m,
             "ofi": ofi,
             "mean_tr": mean_tr,
             "adx": adx,
@@ -366,43 +462,63 @@ class StrategyEngine:
             "minus_di": minus_di,
             "vol_sma": vol_sma,
             "current_vol": current_vol,
+            "rsi": rsi_1m,
+            "slope_1m": slope_1m,
+            "r2_1m": r2_1m,
+            "slope_5m": slope_5m,
+            "r2_5m": r2_5m,
+            "pct_b": pct_b,
         }
 
-        # 1. Volatility Expansion Check (breakout condition)
-        # Requires ATR expansion AND volume confirmation if enabled
+        # 1. Volatility Expansion Check (High Conviction Breakout)
         is_atr_expansion = atr > (1.6 * mean_tr) and mean_tr > 0
         volume_ok = True
         if self.exec_cfg.volume_confirmation and vol_sma > 0:
             volume_ok = (current_vol >= vol_sma * self.exec_cfg.volume_multiplier)
 
-        if is_atr_expansion and volume_ok:
+        if is_atr_expansion and volume_ok and abs(ofi) > 0:
             return MarketRegime.VOLATILITY_EXPANSION, metrics
 
-        # ADX Trend Filter: Suppress trend scalps if ADX indicates low-volatility chop
-        if self.exec_cfg.adx_filter and adx > 0 and adx < self.exec_cfg.adx_threshold:
-            return MarketRegime.LOW_VOL_CHOP, metrics
+        # 2. High-Probability Trend Pullback (Buy Dips in Macro Uptrend, Sell Rallies in Macro Downtrend)
+        is_macro_bull = ema9_5m > ema21_5m and current_close >= ema50_15m and current_close > vwap_5m and slope_5m > 0
+        is_macro_bear = ema9_5m < ema21_5m and current_close <= ema50_15m and current_close < vwap_5m and slope_5m < 0
 
-        # 2. Bullish Alignment (1m ribbon + 5m confirmation + 15m macro + DI orientation)
+        last_bar = tf_1m.bars[-1]
+        if is_macro_bull and last_bar.low <= ema21 and 38 <= rsi_1m <= 60 and ofi >= 0:
+            metrics["pullback_side"] = 1.0  # Buy
+            return MarketRegime.TREND_PULLBACK, metrics
+
+        if is_macro_bear and last_bar.high >= ema21 and 40 <= rsi_1m <= 62 and ofi <= 0:
+            metrics["pullback_side"] = -1.0  # Sell
+            return MarketRegime.TREND_PULLBACK, metrics
+
+        # 3. Macro & Micro Momentum Alignment (BULL_TREND / BEAR_TREND)
         is_bull_ribbon_1m = ema9 > ema21 > ema50
         is_bull_ribbon_5m = ema9_5m >= ema21_5m
-        is_macro_bull = current_close >= ema50_15m
         is_above_vwap = current_close > vwap
         is_bull_di = (plus_di >= minus_di) if adx > 0 else True
 
         if is_bull_ribbon_1m and is_bull_ribbon_5m and is_macro_bull and is_above_vwap and is_bull_di and ofi >= 0:
             return MarketRegime.BULL_TREND, metrics
 
-        # 3. Bearish Alignment (1m ribbon + 5m confirmation + 15m macro + DI orientation)
         is_bear_ribbon_1m = ema9 < ema21 < ema50
         is_bear_ribbon_5m = ema9_5m <= ema21_5m
-        is_macro_bear = current_close <= ema50_15m
         is_below_vwap = current_close < vwap
         is_bear_di = (minus_di >= plus_di) if adx > 0 else True
 
         if is_bear_ribbon_1m and is_bear_ribbon_5m and is_macro_bear and is_below_vwap and is_bear_di and ofi <= 0:
             return MarketRegime.BEAR_TREND, metrics
 
-        # 4. Otherwise: Low-Volatility Chop (Suppress trend strategies)
+        # 4. Mean-Reversion Scalp in Range / Low ADX Chop (ADX < 24)
+        if adx < 24 or abs(slope_5m) < 0.00005:
+            if pct_b <= 0.15 and rsi_1m <= 38 and ofi >= 0:
+                metrics["range_side"] = 1.0  # Buy
+                return MarketRegime.MEAN_REVERSION_RANGE, metrics
+            elif pct_b >= 0.85 and rsi_1m >= 62 and ofi <= 0:
+                metrics["range_side"] = -1.0  # Sell
+                return MarketRegime.MEAN_REVERSION_RANGE, metrics
+
+        # 5. Otherwise: Low-Volatility Chop (Suppress trend strategies)
         return MarketRegime.LOW_VOL_CHOP, metrics
 
     def generate_signal(
@@ -413,7 +529,7 @@ class StrategyEngine:
     ) -> Optional[Signal]:
         """
         Synthesizes technical features and orderbook micro-structure into actionable signals.
-        Enforces Maker-First post-only execution with native ATR bracket pricing.
+        Enforces Maker-First post-only execution with native fee-aware bracket pricing.
         """
         best_bid, _ = orderbook.best_bid
         best_ask, _ = orderbook.best_ask
@@ -435,11 +551,12 @@ class StrategyEngine:
             return None
 
         atr = metrics.get("atr", 0.0)
+        atr_5m = metrics.get("atr_5m", 0.0)
         if atr <= 0:
             return None
 
         tp_atr_mult = self.exec_cfg.bracket_tp_atr_mult
-        breakout_tp = getattr(self.exec_cfg, "breakout_tp_atr_mult", 2.2)
+        breakout_tp = getattr(self.exec_cfg, "breakout_tp_atr_mult", 1.40)
         sl_atr_mult = self.exec_cfg.bracket_sl_atr_mult
 
         # Adverse Funding Rate Filter helper
@@ -461,22 +578,148 @@ class StrategyEngine:
                 return True
             return False
 
-        # High-Conviction Breakout Momentum (Volatility Expansion with expanded TP)
+        # Helper to compute fee-aware bracket distances
+        def get_bracket_distances(price: float, is_5m_wave: bool = True) -> Tuple[float, float]:
+            base_atr = atr_5m if (is_5m_wave and atr_5m > 0) else atr
+            # Enforce minimum profit target of 35 bps to solidly clear all exchange fees
+            min_tp_dist = price * 0.0035
+            tp_dist = max(tp_atr_mult * base_atr, min_tp_dist)
+            sl_dist = max(sl_atr_mult * base_atr, price * 0.0025)
+            return tp_dist, sl_dist
+
+        # Retrieve dynamic online learner weights if active
+        def get_conviction(base: float, regime_key: str) -> float:
+            if not self.learner:
+                return base
+            w = self.learner.get_weight(regime_key)
+            return min(0.98, max(0.50, round(base * w, 2)))
+
+        # 1. High-Conviction Trend Pullback (Dip Buying / Rally Selling)
+        if regime == MarketRegime.TREND_PULLBACK:
+            pullback_side = metrics.get("pullback_side", 1.0)
+            if pullback_side > 0:
+                side = "Buy"
+                if is_funding_adverse(side):
+                    return None
+                price = best_bid
+                tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+                tp_price = round(price + tp_dist, 4)
+                sl_price = round(price - sl_dist, 4)
+                conviction = get_conviction(0.85, "trend_pullback")
+
+                return Signal(
+                    symbol=symbol,
+                    side=side,
+                    regime=regime,
+                    conviction=conviction,
+                    price=price,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    atr=atr,
+                    order_type="Limit",
+                    time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
+                    leverage=self.risk_cfg.default_leverage,
+                    metadata=metrics,
+                )
+            else:
+                side = "Sell"
+                if is_funding_adverse(side):
+                    return None
+                price = best_ask
+                tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+                tp_price = round(price - tp_dist, 4)
+                sl_price = round(price + sl_dist, 4)
+                conviction = get_conviction(0.85, "trend_pullback")
+
+                return Signal(
+                    symbol=symbol,
+                    side=side,
+                    regime=regime,
+                    conviction=conviction,
+                    price=price,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    atr=atr,
+                    order_type="Limit",
+                    time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
+                    leverage=self.risk_cfg.default_leverage,
+                    metadata=metrics,
+                )
+
+        # 2. Mean-Reversion Scalping in Range/Chop
+        if regime == MarketRegime.MEAN_REVERSION_RANGE:
+            range_side = metrics.get("range_side", 1.0)
+            if range_side > 0:
+                side = "Buy"
+                if is_funding_adverse(side):
+                    return None
+                price = best_bid
+                tp_dist = max(1.10 * atr, price * 0.0030)
+                sl_dist = max(0.85 * atr, price * 0.0022)
+                tp_price = round(price + tp_dist, 4)
+                sl_price = round(price - sl_dist, 4)
+                conviction = get_conviction(0.75, "mean_reversion")
+
+                return Signal(
+                    symbol=symbol,
+                    side=side,
+                    regime=regime,
+                    conviction=conviction,
+                    price=price,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    atr=atr,
+                    order_type="Limit",
+                    time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
+                    leverage=self.risk_cfg.default_leverage,
+                    metadata=metrics,
+                )
+            else:
+                side = "Sell"
+                if is_funding_adverse(side):
+                    return None
+                price = best_ask
+                tp_dist = max(1.10 * atr, price * 0.0030)
+                sl_dist = max(0.85 * atr, price * 0.0022)
+                tp_price = round(price - tp_dist, 4)
+                sl_price = round(price + sl_dist, 4)
+                conviction = get_conviction(0.75, "mean_reversion")
+
+                return Signal(
+                    symbol=symbol,
+                    side=side,
+                    regime=regime,
+                    conviction=conviction,
+                    price=price,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    atr=atr,
+                    order_type="Limit",
+                    time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
+                    leverage=self.risk_cfg.default_leverage,
+                    metadata=metrics,
+                )
+
+        # 3. High-Conviction Breakout Momentum (Volatility Expansion)
         if regime == MarketRegime.VOLATILITY_EXPANSION:
             # Direction determined by VWAP and OFI
             if metrics["close"] > metrics["vwap"] and orderbook.ofi > 0:
                 side = "Buy"
                 if is_funding_adverse(side):
                     return None
-                # Aggressive breakout: IOC limit slightly inside best ask
                 price = best_ask
-                tp_price = round(price + (breakout_tp * atr), 4)
-                sl_price = round(price - (sl_atr_mult * atr), 4)
+                base_atr = atr_5m if atr_5m > 0 else atr
+                tp_dist = max(breakout_tp * base_atr, price * 0.0040)
+                sl_dist = max(sl_atr_mult * base_atr, price * 0.0028)
+                tp_price = round(price + tp_dist, 4)
+                sl_price = round(price - sl_dist, 4)
+                conviction = get_conviction(0.80, "volatility_expansion")
+
                 return Signal(
                     symbol=symbol,
                     side=side,
                     regime=regime,
-                    conviction=0.90,
+                    conviction=conviction,
                     price=price,
                     tp_price=tp_price,
                     sl_price=sl_price,
@@ -491,13 +734,18 @@ class StrategyEngine:
                 if is_funding_adverse(side):
                     return None
                 price = best_bid
-                tp_price = round(price - (breakout_tp * atr), 4)
-                sl_price = round(price + (sl_atr_mult * atr), 4)
+                base_atr = atr_5m if atr_5m > 0 else atr
+                tp_dist = max(breakout_tp * base_atr, price * 0.0040)
+                sl_dist = max(sl_atr_mult * base_atr, price * 0.0028)
+                tp_price = round(price - tp_dist, 4)
+                sl_price = round(price + sl_dist, 4)
+                conviction = get_conviction(0.80, "volatility_expansion")
+
                 return Signal(
                     symbol=symbol,
                     side=side,
                     regime=regime,
-                    conviction=0.90,
+                    conviction=conviction,
                     price=price,
                     tp_price=tp_price,
                     sl_price=sl_price,
@@ -509,16 +757,16 @@ class StrategyEngine:
                 )
             return None
 
-        # Maker-First Trend Scalping (BULL_TREND / BEAR_TREND)
+        # 4. Maker-First Trend Scalping (BULL_TREND / BEAR_TREND)
         if regime == MarketRegime.BULL_TREND:
             side = "Buy"
             if is_funding_adverse(side):
                 return None
-            # PostOnly limit: sit at best bid to earn maker rebate
             price = best_bid
-            tp_price = round(price + (tp_atr_mult * atr), 4)
-            sl_price = round(price - (sl_atr_mult * atr), 4)
-            conviction = 0.75
+            tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+            tp_price = round(price + tp_dist, 4)
+            sl_price = round(price - sl_dist, 4)
+            conviction = get_conviction(0.78, "trend_momentum")
 
             return Signal(
                 symbol=symbol,
@@ -539,11 +787,11 @@ class StrategyEngine:
             side = "Sell"
             if is_funding_adverse(side):
                 return None
-            # PostOnly limit: sit at best ask
             price = best_ask
-            tp_price = round(price - (tp_atr_mult * atr), 4)
-            sl_price = round(price + (sl_atr_mult * atr), 4)
-            conviction = 0.75
+            tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+            tp_price = round(price - tp_dist, 4)
+            sl_price = round(price + sl_dist, 4)
+            conviction = get_conviction(0.78, "trend_momentum")
 
             return Signal(
                 symbol=symbol,
@@ -561,3 +809,4 @@ class StrategyEngine:
             )
 
         return None
+

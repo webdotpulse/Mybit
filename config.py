@@ -71,8 +71,8 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
                 "symbols": active_symbols,
                 "max_open_positions": 2,
                 "max_daily_risk_pct": 3.5,
-                "min_position_equity_pct": 0.75,
-                "max_position_equity_pct": 1.5,
+                "min_position_equity_pct": 1.0,
+                "max_position_equity_pct": 3.0,
                 "default_leverage": 5,
                 "auto_tuning_interval": 20,
                 "description": f"Growth Tier (${int(equity)} USD). Highly liquid pairs, max 2 concurrent positions, 3.5% daily risk."
@@ -192,7 +192,7 @@ class ExecutionConfig(BaseModel):
         description="Timeout waiting for maker fill before recalculating or aggressive IOC"
     )
     bracket_tp_atr_mult: float = Field(
-        default=1.2,
+        default=1.35,
         ge=0.4,
         le=5.0,
         description="ATR multiplier for native Take Profit bracket"
@@ -204,7 +204,7 @@ class ExecutionConfig(BaseModel):
         description="ATR multiplier for high-conviction breakout Take Profit bracket"
     )
     bracket_sl_atr_mult: float = Field(
-        default=0.8,
+        default=0.90,
         ge=0.2,
         le=3.0,
         description="ATR multiplier for native Stop Loss bracket"
@@ -214,20 +214,20 @@ class ExecutionConfig(BaseModel):
         description="Enable dynamic trailing stop adjustment as position moves in profit"
     )
     breakeven_atr_trigger: float = Field(
-        default=1.25,
+        default=0.75,
         ge=0.2,
         le=3.0,
         description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
     )
     breakeven_buffer_bps: float = Field(
-        default=15.0,
+        default=12.0,
         ge=0.0,
         le=50.0,
         description="Buffer in basis points above entry price when setting Breakeven Stop Loss (covers round-trip fees + slippage)"
     )
     stagnant_exit_mins: int = Field(
-        default=45,
-        ge=5,
+        default=15,
+        ge=2,
         le=240,
         description="Holding minutes after which a stagnant scalp position is evaluated for exit"
     )
@@ -247,11 +247,11 @@ class ExecutionConfig(BaseModel):
         le=0.002,
         description="Maximum adverse funding rate (0.03%) before suppressing trend entries"
     )
-    trade_cooldown_mins: int = Field(
-        default=12,
-        ge=0,
-        le=120,
-        description="Minimum cooldown in minutes after trade exit before re-entering same pair"
+    trade_cooldown_mins: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=120.0,
+        description="Minimum cooldown in minutes after trade exit before re-entering same pair (e.g. 0.5 = 30s)"
     )
     adx_filter: bool = Field(
         default=True,

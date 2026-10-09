@@ -48,11 +48,10 @@ class TradingEngine:
             credentials=credentials,
             trading_mode=config.trading_mode,
         )
-        self.strategy = StrategyEngine(config)
-        self.risk_manager = RiskManager(config, self.client)
-
         db_path = config.data_dir / "trading_journal.db"
         self.journal = TradeJournal(db_path)
+        self.strategy = StrategyEngine(config, learner=self.journal.learner)
+        self.risk_manager = RiskManager(config, self.client)
         self.auto_tuner = ParameterAutoTuner(self.journal, config)
 
         self.telegram = TelegramNotifier(
@@ -70,6 +69,7 @@ class TradingEngine:
         self._last_funding_fetch: float = 0.0
         self._last_trade_exit: Dict[str, float] = {}
         self._last_pos_heartbeat: float = 0.0
+        self._processed_closed_trades: set[str] = set()
         self.status_file = self.config.data_dir / "engine_status.json"
 
     async def apply_capital_tier(self, total_equity: float, force: bool = False) -> None:
@@ -215,8 +215,9 @@ class TradingEngine:
         self.client.wallet_callbacks.append(self._on_wallet_update)
         self.client.position_callbacks.append(self._on_position_update)
 
-        # 5. Perform initial state reconciliation
+        # 5. Perform initial state reconciliation and hydrate past trade memory
         await self.risk_manager.reconcile()
+        await self._sync_closed_pnl()
 
         # 6. Start WebSocket streaming
         await self.client.start_streams()
@@ -295,48 +296,98 @@ class TradingEngine:
                     )
 
     async def _on_execution_update(self, exec_data: Dict[str, Any]) -> None:
-        """Processes real-time fills, logs trade metrics, and tunes parameters."""
+        """Processes real-time fills, logs trade metrics, and triggers PnL synchronization."""
         try:
             symbol = exec_data.get("symbol", "")
             side = exec_data.get("side", "")
             exec_price = float(exec_data.get("execPrice", 0.0))
             exec_qty = float(exec_data.get("execQty", 0.0))
-            exec_fee = float(exec_data.get("execFee", 0.0))
-            order_type = exec_data.get("orderType", "Limit")
-            order_id = exec_data.get("orderId", "")
-            order_link_id = exec_data.get("orderLinkId", "")
             is_maker = exec_data.get("isMaker", False)
-            exec_time = int(exec_data.get("execTime", time.time() * 1000))
 
-            # Query realized PnL if this is a closing fill
-            closed_pnl = float(exec_data.get("closedPnl", 0.0))
-            if closed_pnl != 0.0:
+            if exec_qty > 0:
+                logger.info(
+                    f"🎉 [FILLED] {symbol} {side} {exec_qty} filled @ ${exec_price:.4f} "
+                    f"({'Maker Rebate' if is_maker else 'Taker'})"
+                )
+                # Immediately synchronize closed PnL if this was an exit fill
+                asyncio.create_task(self._sync_closed_pnl(symbol))
+        except Exception as e:
+            logger.error(f"Error handling execution update: {e}")
+
+    async def _sync_closed_pnl(self, symbol: Optional[str] = None) -> None:
+        """
+        Fetches realized closed PnL records directly from Bybit /v5/position/closed-pnl.
+        Reliably updates TradeJournal, OnlineStrategyLearner, RiskManager, and AutoTuner.
+        """
+        try:
+            records = await self.client.get_closed_pnl(symbol=symbol, limit=20)
+            if not records:
+                return
+
+            for rec in records:
+                order_id = str(rec.get("orderId") or rec.get("id") or "")
+                rec_sym = rec.get("symbol", "")
+                if not rec_sym:
+                    continue
+
+                updated_time = int(rec.get("updatedTime") or rec.get("createdTime") or (time.time() * 1000))
+                record_key = f"{rec_sym}_{order_id}_{updated_time}"
+                if record_key in self._processed_closed_trades:
+                    continue
+
+                closed_pnl = float(rec.get("closedPnl", 0.0))
+                if closed_pnl == 0.0:
+                    continue
+
+                self._processed_closed_trades.add(record_key)
+                if len(self._processed_closed_trades) > 1000:
+                    self._processed_closed_trades = set(list(self._processed_closed_trades)[-500:])
+
+                exit_price = float(rec.get("avgExitPrice") or rec.get("orderPrice") or 0.0)
+                entry_price = float(rec.get("avgEntryPrice") or 0.0)
+                qty = float(rec.get("closedSize") or rec.get("qty") or 0.0)
+                side = rec.get("side", "")
+                order_type = rec.get("orderType", "Limit")
+                fee_paid = float(rec.get("execFee", 0.0))
+
+                # Context from order or position placement
+                ctx = self._position_context.pop(rec_sym, {})
+                if not entry_price and ctx.get("price"):
+                    entry_price = float(ctx["price"])
+                entry_ts = int(ctx.get("placed_at", (updated_time / 1000.0) - 30.0) * 1000)
+                holding_sec = max(1.0, round((updated_time - entry_ts) / 1000.0, 1))
+
+                notional = max(1.0, entry_price * qty)
+                pnl_pct = (closed_pnl / notional) * 100.0
+                regime_str = str(ctx.get("regime", "TREND_PULLBACK"))
+
+                # 1. Update risk manager metrics
                 self.risk_manager.record_trade_fill(closed_pnl)
-                self.strategy.record_trade_result(closed_pnl)
 
-                # Retrieve saved position context for accurate feature recording
-                ctx = self._position_context.pop(symbol, {})
-                entry_px = float(ctx.get("price") or exec_price)
-                entry_ts = int(ctx.get("placed_at", exec_time / 1000.0 - 30.0) * 1000)
-                holding_sec = max(1.0, round((exec_time - entry_ts) / 1000.0, 1))
+                # 2. Update strategy engine memory & online reinforcement learner
+                self.strategy.record_trade_result(
+                    pnl=closed_pnl,
+                    regime=regime_str,
+                    metadata=ctx,
+                )
 
-                # Create trade journal entry with full quantitative context
+                # 3. Create persistent trade journal record
                 tr = TradeRecord(
-                    trade_id=order_link_id or order_id,
-                    symbol=symbol,
+                    trade_id=order_id or f"closed_{updated_time}",
+                    symbol=rec_sym,
                     side=side,
                     entry_time=entry_ts,
-                    exit_time=exec_time,
+                    exit_time=updated_time,
                     holding_time_sec=holding_sec,
-                    entry_price=entry_px,
-                    exit_price=exec_price,
-                    qty=exec_qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    qty=qty,
                     realized_pnl=closed_pnl,
-                    realized_pnl_pct=(closed_pnl / max(1.0, entry_px * exec_qty)) * 100.0,
-                    fee_paid=exec_fee,
-                    slippage_bps=round(abs(exec_price - entry_px) / entry_px * 10000.0, 1) if entry_px > 0 else 0.0,
-                    order_type="Maker" if is_maker else "Taker",
-                    regime=str(ctx.get("regime", "ACTIVE")),
+                    realized_pnl_pct=pnl_pct,
+                    fee_paid=fee_paid,
+                    slippage_bps=round(abs(exit_price - entry_price) / max(0.0001, entry_price) * 10000.0, 1) if entry_price > 0 else 0.0,
+                    order_type=order_type,
+                    regime=regime_str,
                     conviction=float(ctx.get("conviction", 0.8)),
                     atr_at_entry=float(ctx.get("atr", 0.0)),
                     ema_spread_at_entry=float(ctx.get("ema_spread", 0.0)),
@@ -344,31 +395,26 @@ class TradingEngine:
                     ofi_at_entry=float(ctx.get("ofi", 0.0)),
                 )
                 self.journal.record_trade(tr)
-                self._last_trade_exit[symbol] = time.time()
+                self._last_trade_exit[rec_sym] = time.time()
 
-                # Send Telegram fill alert
+                # 4. Dispatch Telegram exit alert
                 await self.telegram.send_trade_exit(
-                    symbol=symbol,
+                    symbol=rec_sym,
                     side=side,
-                    exit_price=exec_price,
+                    exit_price=exit_price,
                     pnl=closed_pnl,
-                    pnl_pct=tr.realized_pnl_pct,
+                    pnl_pct=pnl_pct,
                     holding_sec=holding_sec,
                 )
 
-                # Trigger periodic auto-tuning
+                # 5. Evaluate dynamic parameter auto-tuning
                 tuning_res = self.auto_tuner.evaluate_and_tune()
                 if tuning_res:
                     await self.telegram.send_message(
                         f"⚙️ *Self-Adaptive Tuning Activated*\n{tuning_res['rationale']}"
                     )
-            elif exec_qty > 0:
-                logger.info(
-                    f"🎉 [FILLED] {symbol} {side} {exec_qty} filled @ ${exec_price:.4f} "
-                    f"({'Maker Rebate' if is_maker else 'Taker'})"
-                )
         except Exception as e:
-            logger.error(f"Error handling execution update: {e}")
+            logger.error(f"Error syncing closed PnL for {symbol}: {e}")
 
     async def _on_order_update(self, order_data: Dict[str, Any]) -> None:
         """Updates internal order tracking."""
@@ -409,7 +455,9 @@ class TradingEngine:
                     entry_features=entry_features,
                 )
             else:
-                self.risk_manager.positions.pop(symbol, None)
+                if symbol in self.risk_manager.positions:
+                    self.risk_manager.positions.pop(symbol, None)
+                    asyncio.create_task(self._sync_closed_pnl(symbol))
         except Exception as e:
             logger.debug(f"Position stream parse error: {e}")
 
@@ -478,7 +526,7 @@ class TradingEngine:
                         continue
 
                     # Don't open if in post-trade cooldown for this symbol
-                    cooldown_sec = self.config.execution.trade_cooldown_mins * 60
+                    cooldown_sec = float(self.config.execution.trade_cooldown_mins) * 60.0
                     if (now - self._last_trade_exit.get(symbol, 0.0)) < cooldown_sec:
                         continue
 
@@ -580,6 +628,7 @@ class TradingEngine:
                     "ema_spread": sig.metadata.get("ema9", 0.0) - sig.metadata.get("ema50", 0.0),
                     "vwap_delta": sig.price - sig.metadata.get("vwap", sig.price),
                     "ofi": sig.metadata.get("ofi", 0.0),
+                    "r2": sig.metadata.get("r2_1m", 0.0),
                 }
                 self._position_context[sig.symbol] = ctx
                 self._order_context[order_id] = ctx
@@ -622,6 +671,7 @@ class TradingEngine:
                 "ema_spread": sig.metadata.get("ema9", 0.0) - sig.metadata.get("ema50", 0.0),
                 "vwap_delta": sig.price - sig.metadata.get("vwap", sig.price),
                 "ofi": sig.metadata.get("ofi", 0.0),
+                "r2": sig.metadata.get("r2_1m", 0.0),
             }
             self._position_context[sig.symbol] = ctx
             self._order_context[order_id] = ctx
@@ -698,6 +748,9 @@ class TradingEngine:
                 for oid in list(self._pending_orders.keys()):
                     if now_sec - self._pending_orders[oid].get("placed_at", now_sec) > 45:
                         self._pending_orders.pop(oid, None)
+
+                # Periodically sync realized closed PnL from Bybit exchange
+                await self._sync_closed_pnl()
             except asyncio.CancelledError:
                 break
             except Exception as e:
