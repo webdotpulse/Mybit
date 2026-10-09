@@ -55,8 +55,8 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
                 "symbols": ["DOGEUSDT", "SUIUSDT", "SOLUSDT"],
                 "max_open_positions": 1,
                 "max_daily_risk_pct": 5.0,  # 5% gives breathing room on micro accounts
-                "min_position_equity_pct": 2.0,
-                "max_position_equity_pct": 5.0,
+                "min_position_equity_pct": 5.0,
+                "max_position_equity_pct": 10.0,
                 "default_leverage": 5,
                 "auto_tuning_interval": 15,
                 "description": "Micro/Bootstrap Tier ($10 - $99). Low-notional altcoins (DOGE/SUI/SOL), max 1 position, 5% daily risk."
@@ -71,9 +71,9 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
                 "symbols": active_symbols,
                 "max_open_positions": 2,
                 "max_daily_risk_pct": 3.5,
-                "min_position_equity_pct": 1.0,
-                "max_position_equity_pct": 3.0,
-                "default_leverage": 5,
+                "min_position_equity_pct": 12.0,
+                "max_position_equity_pct": 20.0,
+                "default_leverage": 10,
                 "auto_tuning_interval": 20,
                 "description": f"Growth Tier (${int(equity)} USD). Highly liquid pairs, max 2 concurrent positions, 3.5% daily risk."
             }
@@ -132,13 +132,13 @@ class RiskConfig(BaseModel):
     min_position_equity_pct: float = Field(
         default=0.5,
         ge=0.1,
-        le=5.0,
+        le=35.0,
         description="Lower bound Kelly position sizing fraction (%)"
     )
     max_position_equity_pct: float = Field(
         default=1.5,
         ge=0.5,
-        le=10.0,
+        le=50.0,
         description="Upper bound Kelly position sizing fraction (%)"
     )
     max_consecutive_losses: int = Field(
@@ -160,7 +160,7 @@ class RiskConfig(BaseModel):
         description="ATR volatility spike kill switch threshold in standard deviations"
     )
     default_leverage: int = Field(
-        default=5,
+        default=10,
         ge=1,
         le=50,
         description="Default position leverage for linear perpetuals"
@@ -213,14 +213,30 @@ class ExecutionConfig(BaseModel):
         default=True,
         description="Enable dynamic trailing stop adjustment as position moves in profit"
     )
+    tiered_tp_enabled: bool = Field(
+        default=True,
+        description="Enable 2-tier Lock & Run take-profit (banks 50% quick, rides runner risk-free)"
+    )
+    tp1_ratio: float = Field(
+        default=0.5,
+        ge=0.2,
+        le=0.8,
+        description="Ratio of position size closed at Tier 1 Take Profit"
+    )
+    tp1_bps: float = Field(
+        default=28.0,
+        ge=15.0,
+        le=50.0,
+        description="Target basis points for Tier 1 quick profit lock"
+    )
     breakeven_atr_trigger: float = Field(
-        default=0.75,
+        default=0.50,
         ge=0.2,
         le=3.0,
         description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
     )
     breakeven_buffer_bps: float = Field(
-        default=12.0,
+        default=10.0,
         ge=0.0,
         le=50.0,
         description="Buffer in basis points above entry price when setting Breakeven Stop Loss (covers round-trip fees + slippage)"
@@ -309,6 +325,27 @@ class StrategyConfig(BaseModel):
         ge=10,
         le=100,
         description="Number of closed trades between parameter auto-tuning passes"
+    )
+    auto_scan_symbols: bool = Field(
+        default=True,
+        description="Autonomously scan and trade top volume/volatility Bybit pairs"
+    )
+    scanner_interval_mins: int = Field(
+        default=15,
+        ge=5,
+        le=60,
+        description="Minutes between autonomous market scanning passes"
+    )
+    scanner_min_turnover_usd: float = Field(
+        default=30_000_000.0,
+        ge=1_000_000.0,
+        description="Minimum 24h turnover filter for scanned pairs"
+    )
+    scanner_top_n: int = Field(
+        default=4,
+        ge=2,
+        le=8,
+        description="Number of top dynamic pairs to trade concurrently"
     )
 
 

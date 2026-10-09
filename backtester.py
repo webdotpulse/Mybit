@@ -254,6 +254,28 @@ class QuantitativeBacktester:
                 qty = open_pos["qty"]
                 notional = qty * entry_px
 
+                # A0. Check 2-Tier "Lock & Run" Partial Take-Profit (+28 bps)
+                exec_cfg = self.config.execution
+                if exec_cfg.tiered_tp_enabled and not open_pos["tp1_filled"] and open_pos.get("tp1_price"):
+                    tp1_hit = (bar.high >= open_pos["tp1_price"]) if side == "Buy" else (bar.low <= open_pos["tp1_price"])
+                    if tp1_hit:
+                        tp1_qty = open_pos["qty"] * exec_cfg.tp1_ratio
+                        tp1_px = open_pos["tp1_price"]
+                        tp1_gross = (tp1_px - entry_px) * tp1_qty if side == "Buy" else (entry_px - tp1_px) * tp1_qty
+                        tp1_fee = (tp1_qty * tp1_px) * self.taker_fee
+                        portion_entry_fee = open_pos["entry_fee"] * exec_cfg.tp1_ratio
+                        open_pos["realized_tp1_pnl"] = tp1_gross - portion_entry_fee - tp1_fee
+                        open_pos["realized_tp1_fee"] = portion_entry_fee + tp1_fee
+                        open_pos["entry_fee"] -= portion_entry_fee
+                        open_pos["qty"] -= tp1_qty
+                        equity += open_pos["realized_tp1_pnl"]
+                        total_fees += (portion_entry_fee + tp1_fee)
+                        open_pos["tp1_filled"] = True
+                        open_pos["breakeven_set"] = True
+                        # Advance stop loss on remaining half to entry + buffer (risk-free run)
+                        fee_buffer = entry_px * (exec_cfg.breakeven_buffer_bps / 10000.0)
+                        open_pos["sl_price"] = entry_px + fee_buffer if side == "Buy" else entry_px - fee_buffer
+
                 # A. Check Exit Triggers against Bar High/Low (prior to same-bar breakeven)
                 exit_occurred = False
                 exit_price = 0.0
@@ -300,18 +322,25 @@ class QuantitativeBacktester:
 
                 # D. Process Position Closure
                 if exit_occurred:
+                    rem_qty = open_pos["qty"]
                     if side == "Buy":
-                        gross_pnl = (exit_price - entry_px) * qty
+                        gross_pnl = (exit_price - entry_px) * rem_qty
                     else:
-                        gross_pnl = (entry_px - exit_price) * qty
+                        gross_pnl = (entry_px - exit_price) * rem_qty
 
-                    exit_fee = (qty * exit_price) * (self.maker_fee if exit_reason == "TP" else self.taker_fee)
-                    net_trade_pnl = gross_pnl - open_pos["entry_fee"] - exit_fee
+                    exit_fee = (rem_qty * exit_price) * (self.maker_fee if exit_reason == "TP" else self.taker_fee)
+                    net_trade_pnl = gross_pnl - open_pos["entry_fee"] - exit_fee + open_pos["realized_tp1_pnl"]
                     total_fees += (open_pos["entry_fee"] + exit_fee)
-                    equity += net_trade_pnl
+                    equity += (gross_pnl - open_pos["entry_fee"] - exit_fee)
+                    all_fees = open_pos["entry_fee"] + exit_fee + open_pos["realized_tp1_fee"]
+
+                    if open_pos["tp1_filled"]:
+                        exit_reason = f"TP1+{exit_reason}"
 
                     strat.record_trade_result(net_trade_pnl, regime=open_pos["regime"])
 
+                    orig_qty = open_pos["original_qty"]
+                    orig_notional = orig_qty * entry_px
                     closed_trades.append(
                         BacktestTrade(
                             trade_id=trade_id_counter,
@@ -322,11 +351,11 @@ class QuantitativeBacktester:
                             holding_mins=round(duration_mins, 1),
                             entry_price=entry_px,
                             exit_price=round(exit_price, 4),
-                            qty=qty,
-                            notional=round(notional, 2),
+                            qty=orig_qty,
+                            notional=round(orig_notional, 2),
                             pnl=round(net_trade_pnl, 4),
-                            pnl_pct=round((net_trade_pnl / max(1.0, notional / self.config.risk.default_leverage)) * 100.0, 2),
-                            fees=round(open_pos["entry_fee"] + exit_fee, 4),
+                            pnl_pct=round((net_trade_pnl / max(1.0, orig_notional / self.config.risk.default_leverage)) * 100.0, 2),
+                            fees=round(all_fees, 4),
                             exit_reason=exit_reason,
                             regime=open_pos["regime"],
                             atr=round(atr, 4),
@@ -378,10 +407,15 @@ class QuantitativeBacktester:
                             "sl_price": signal.sl_price,
                             "atr": signal.atr,
                             "qty": qty,
+                            "original_qty": qty,
                             "entry_fee": entry_fee,
                             "opened_at": bar.timestamp,
                             "breakeven_set": False,
                             "regime": signal.regime.value,
+                            "tp1_price": signal.tp1_price,
+                            "tp1_filled": False,
+                            "realized_tp1_pnl": 0.0,
+                            "realized_tp1_fee": 0.0,
                         }
 
         # Close open position at end of backtest if still open
@@ -390,13 +424,16 @@ class QuantitativeBacktester:
             side = open_pos["side"]
             entry_px = open_pos["entry_price"]
             exit_px = last_bar.close
-            qty = open_pos["qty"]
-            notional = qty * entry_px
-            gross_pnl = (exit_px - entry_px) * qty if side == "Buy" else (entry_px - exit_px) * qty
-            exit_fee = notional * self.taker_fee
-            net_pnl = gross_pnl - open_pos["entry_fee"] - exit_fee
-            equity += net_pnl
+            rem_qty = open_pos["qty"]
+            gross_pnl = (exit_px - entry_px) * rem_qty if side == "Buy" else (entry_px - exit_px) * rem_qty
+            exit_fee = (rem_qty * exit_px) * self.taker_fee
+            net_trade_pnl = gross_pnl - open_pos["entry_fee"] - exit_fee + open_pos["realized_tp1_pnl"]
+            equity += (gross_pnl - open_pos["entry_fee"] - exit_fee)
+            all_fees = open_pos["entry_fee"] + exit_fee + open_pos["realized_tp1_fee"]
             total_fees += (open_pos["entry_fee"] + exit_fee)
+            reason = "TP1+END_OF_DATA" if open_pos["tp1_filled"] else "END_OF_DATA"
+            orig_qty = open_pos["original_qty"]
+            orig_notional = orig_qty * entry_px
             closed_trades.append(
                 BacktestTrade(
                     trade_id=trade_id_counter,
@@ -407,12 +444,12 @@ class QuantitativeBacktester:
                     holding_mins=round((last_bar.timestamp - open_pos["opened_at"]) / 60000.0, 1),
                     entry_price=entry_px,
                     exit_price=round(exit_px, 4),
-                    qty=qty,
-                    notional=round(notional, 2),
-                    pnl=round(net_pnl, 4),
-                    pnl_pct=round((net_pnl / max(1.0, notional / self.config.risk.default_leverage)) * 100.0, 2),
-                    fees=round(open_pos["entry_fee"] + exit_fee, 4),
-                    exit_reason="END_OF_DATA",
+                    qty=orig_qty,
+                    notional=round(orig_notional, 2),
+                    pnl=round(net_trade_pnl, 4),
+                    pnl_pct=round((net_trade_pnl / max(1.0, orig_notional / self.config.risk.default_leverage)) * 100.0, 2),
+                    fees=round(all_fees, 4),
+                    exit_reason=reason,
                     regime=open_pos["regime"],
                     atr=round(open_pos["atr"], 4),
                 )

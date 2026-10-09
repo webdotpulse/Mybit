@@ -969,6 +969,209 @@ async def test_closed_pnl_synchronization():
         assert engine.journal.get_total_trade_count() == 1
 
 
+@pytest.mark.asyncio
+async def test_tier1_partial_take_profit_lock_and_run():
+    """
+    Verifies 2-Tier 'Lock & Run' partial profit banking:
+    1. At +28 bps, market closes 50% via reduce_only to bank cash.
+    2. Moves Stop-Loss of remaining 50% to Entry + 10 bps to ride momentum risk-free.
+    3. Emits TIER1_PROFIT_LOCKED event.
+    """
+    config = AppConfig()
+    config.execution.tiered_tp_enabled = True
+    config.execution.tp1_ratio = 0.5
+    config.execution.tp1_bps = 28.0
+    config.execution.breakeven_buffer_bps = 10.0
+
+    creds = BybitCredentials(api_key="x" * 12, api_secret="y" * 16, testnet=True)
+    client = BybitV5Client(creds)
+    client.create_order = AsyncMock(return_value={"retCode": 0, "retMsg": "OK"})
+    client.set_trading_stop = AsyncMock(return_value={"retCode": 0, "retMsg": "OK"})
+
+    rm = RiskManager(config, client)
+
+    # Position: Entry $100.0, Size 1.0 SOL, TP1 $100.28 (+28 bps)
+    rm.positions["SOLUSDT"] = Position(
+        symbol="SOLUSDT",
+        side="Buy",
+        size=1.0,
+        entry_price=100.0,
+        mark_price=100.15,  # Below TP1
+        unrealised_pnl=0.15,
+        leverage=10,
+        entry_atr=0.50,
+        tp1_price=100.28,
+        tp1_filled=False,
+        original_size=1.0,
+    )
+
+    # 1. Price below TP1 -> No updates
+    updates = await rm.evaluate_position_stops()
+    assert len(updates) == 0
+    assert rm.positions["SOLUSDT"].tp1_filled is False
+    assert client.create_order.call_count == 0
+
+    # 2. Price crosses TP1 ($100.30 >= $100.28)
+    rm.positions["SOLUSDT"].mark_price = 100.30
+    updates = await rm.evaluate_position_stops()
+
+    assert len(updates) == 1
+    event = updates[0]
+    assert event["type"] == "TIER1_PROFIT_LOCKED"
+    assert event["close_qty"] == 0.5
+    assert event["remaining_size"] == 0.5
+    assert event["new_sl"] == 100.10  # Entry $100.0 + 10 bps ($0.10)
+    assert rm.positions["SOLUSDT"].tp1_filled is True
+    assert rm.positions["SOLUSDT"].breakeven_set is True
+
+    # Verify Market IOC reduce-only order was submitted for 50%
+    client.create_order.assert_called_once_with(
+        symbol="SOLUSDT",
+        side="Sell",
+        order_type="Market",
+        qty=0.5,
+        time_in_force="IOC",
+        reduce_only=True,
+    )
+
+    # Verify Stop Loss was moved to Breakeven (+10 bps) for the remaining position
+    client.set_trading_stop.assert_called_once_with(
+        symbol="SOLUSDT",
+        stop_loss=100.10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_volatility_scanner_ranking_and_rotation(tmp_path):
+    """
+    Verifies Autonomous Volatility Scanner queries Bybit tickers,
+    filters pairs with turnover >= $30M, ranks by volatility & momentum,
+    and rotates symbols while priming klines.
+    """
+    db_file = tmp_path / "test_scanner.db"
+    config = AppConfig()
+    config.strategy.auto_scan_symbols = True
+    config.strategy.scanner_min_turnover_usd = 30_000_000.0
+    config.strategy.scanner_top_n = 3
+    config.strategy.symbols = ["DOGEUSDT", "SOLUSDT"]
+
+    creds = BybitCredentials(api_key="x" * 12, api_secret="y" * 16, testnet=True)
+    from main import TradingEngine
+    engine = TradingEngine(config, creds)
+    engine.journal.db_path = db_file
+    engine.journal._init_db()
+
+    # Mock tickers from Bybit
+    fake_tickers = [
+        # Candidate 1: High turnover, high volatility -> Top rank
+        {
+            "symbol": "NEARUSDT",
+            "turnover24h": "150000000.0",  # $150M
+            "lastPrice": "5.000",
+            "highPrice24h": "5.600",
+            "lowPrice24h": "4.800",
+            "price24hPcnt": "0.12",  # 12%
+        },
+        # Candidate 2: High turnover, strong volatility
+        {
+            "symbol": "SOLUSDT",
+            "turnover24h": "500000000.0",  # $500M
+            "lastPrice": "150.00",
+            "highPrice24h": "156.00",
+            "lowPrice24h": "144.00",
+            "price24hPcnt": "0.06",  # 6%
+        },
+        # Candidate 3: High turnover, moderate volatility
+        {
+            "symbol": "DOGEUSDT",
+            "turnover24h": "80000000.0",  # $80M
+            "lastPrice": "0.1500",
+            "highPrice24h": "0.1580",
+            "lowPrice24h": "0.1450",
+            "price24hPcnt": "0.05",  # 5%
+        },
+        # Candidate 4: Low turnover (< $30M) -> Must be filtered out
+        {
+            "symbol": "LOWVOLUSDT",
+            "turnover24h": "10000000.0",  # $10M
+            "lastPrice": "1.00",
+            "highPrice24h": "1.20",
+            "lowPrice24h": "0.90",
+            "price24hPcnt": "0.20",
+        },
+    ]
+
+    engine.client.get_market_tickers = AsyncMock(return_value=fake_tickers)
+    engine.client.set_leverage = AsyncMock(return_value=True)
+    engine.client.get_klines = AsyncMock(return_value=[])
+    engine.client.add_public_subscriptions = AsyncMock()
+    engine.telegram.send_message = AsyncMock()
+
+    await engine._scan_and_update_symbols()
+
+    # NEARUSDT must be added to top 3 active symbols
+    assert "NEARUSDT" in engine.config.strategy.symbols
+    assert "SOLUSDT" in engine.config.strategy.symbols
+    assert "LOWVOLUSDT" not in engine.config.strategy.symbols
+    assert engine.client.add_public_subscriptions.called
+
+
+@pytest.mark.asyncio
+async def test_position_state_preservation_with_tier1_fields():
+    """
+    Verifies that exchange reconciliation and WebSocket updates preserve
+    tp1_price, tp1_filled, and original_size state without losing metadata.
+    """
+    config = AppConfig()
+    creds = BybitCredentials(api_key="x" * 12, api_secret="y" * 16, testnet=True)
+    client = BybitV5Client(creds)
+    rm = RiskManager(config, client)
+
+    # Pre-populate position with Tier 1 metadata
+    rm.positions["SOLUSDT"] = Position(
+        symbol="SOLUSDT",
+        side="Buy",
+        size=1.0,
+        entry_price=100.0,
+        mark_price=100.20,
+        unrealised_pnl=0.20,
+        leverage=10,
+        entry_atr=0.50,
+        tp1_price=100.28,
+        tp1_filled=True,
+        original_size=2.0,
+    )
+
+    # Simulate exchange returning active position of size 1.0 (after Tier 1 half-fill)
+    client.get_positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "SOLUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "avgPrice": "100.0",
+                "markPrice": "100.25",
+                "unrealisedPnl": "0.25",
+                "leverage": "10",
+                "takeProfit": "101.5",
+                "stopLoss": "100.1",
+            }
+        ]
+    )
+    client.get_open_orders = AsyncMock(return_value=[])
+
+    await rm.reconcile()
+
+    sol_pos = rm.positions.get("SOLUSDT")
+    assert sol_pos is not None
+    assert sol_pos.tp1_price == 100.28
+    assert sol_pos.tp1_filled is True
+    assert sol_pos.original_size == 2.0
+    assert sol_pos.mark_price == 100.25
+
+
+
+
 
 
 

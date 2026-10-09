@@ -436,6 +436,15 @@ class BybitV5Client:
             return (res.get("result") or {}).get("list") or []
         return []
 
+    async def get_market_tickers(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Queries 24h market tickers for linear perpetuals (turnover, high/low, volume)."""
+        cat = category or self.category
+        params: Dict[str, Any] = {"category": cat}
+        res = await self.request("GET", "/v5/market/tickers", params=params, auth_required=False)
+        if res.get("retCode") == 0:
+            return (res.get("result") or {}).get("list") or []
+        return []
+
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Sets leverage for cross/isolated linear perpetual positions."""
         if self.category != "linear":
@@ -640,6 +649,21 @@ class BybitV5Client:
         clean_interval = interval.replace("m", "")
         topic = f"kline.{clean_interval}.{symbol}"
         self._public_topics.add(topic)
+
+    async def add_public_subscriptions(self, topics: List[str]) -> None:
+        """Dynamically registers and subscribes to new public topics on active WebSocket."""
+        new_topics = [t for t in topics if t not in self._public_topics]
+        if not new_topics:
+            return
+        for t in new_topics:
+            self._public_topics.add(t)
+        if self._public_ws:
+            try:
+                sub_msg = {"op": "subscribe", "args": new_topics}
+                await self._public_ws.send(json.dumps(sub_msg))
+                logger.info(f"Dynamically subscribed to {len(new_topics)} new public topics: {new_topics}")
+            except Exception as e:
+                logger.debug(f"Queued {len(new_topics)} topics for next WS reconnect: {e}")
 
     async def start_streams(self) -> None:
         """Spawns resilient background WebSocket tasks."""

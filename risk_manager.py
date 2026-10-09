@@ -40,6 +40,24 @@ def _to_int(val: Any, default: int = 1) -> int:
         return default
 
 
+def format_qty(symbol: str, raw_qty: float) -> float:
+    """Rounds quantity to symbol lot size precision on Bybit V5."""
+    sym = symbol.upper()
+    if "BTC" in sym:
+        return max(0.001, round(raw_qty, 3))
+    elif "ETH" in sym:
+        return max(0.01, round(raw_qty, 2))
+    elif any(k in sym for k in ("SOL", "AVAX", "LINK", "NEAR", "APT", "DOT", "ATOM", "XRP")):
+        return max(0.1, round(raw_qty, 1))
+    elif "SUI" in sym:
+        # Bybit SUIUSDT linear contract: minOrderQty = 10, qtyStep = 10
+        steps = max(1, int(round(raw_qty / 10.0)))
+        return float(steps * 10)
+    elif any(k in sym for k in ("DOGE", "ADA", "TRX", "MATIC", "POL")):
+        return float(max(1, int(round(raw_qty))))
+    return round(raw_qty, 2)
+
+
 @dataclass
 class Position:
     symbol: str
@@ -57,6 +75,10 @@ class Position:
     opened_at: float = field(default_factory=time.time)
     entry_features: Dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
+    tp1_price: Optional[float] = None
+    tp1_filled: bool = False
+    original_size: float = 0.0
+
 
 
 class RiskManager:
@@ -232,6 +254,9 @@ class RiskManager:
                         breakeven_set=existing.breakeven_set if existing else False,
                         opened_at=existing.opened_at if existing else time.time(),
                         entry_features=existing.entry_features if existing else {},
+                        tp1_price=existing.tp1_price if existing else None,
+                        tp1_filled=existing.tp1_filled if existing else False,
+                        original_size=existing.original_size if (existing and existing.original_size > 0) else size,
                     )
                 else:
                     self.positions.pop(symbol, None)
@@ -304,78 +329,141 @@ class RiskManager:
 
     async def evaluate_position_stops(self) -> List[Dict[str, Any]]:
         """
-        Evaluates active positions for Breakeven advancement and Trailing Stop protection.
-        When unrealized profit reaches +breakeven_atr_trigger * entry_atr,
-        advances Stop Loss to entry price + fee buffer (Breakeven).
+        Evaluates active positions for 2-Tier "Lock & Run" Partial Take-Profit and Breakeven advancement.
+        1. When price reaches Tier 1 (+28 bps), market closes 50% to bank cash and locks
+           remaining 50% stop loss at Entry + fee buffer to ride wave risk-free.
+        2. When unrealized profit reaches +breakeven_atr_trigger * entry_atr,
+           advances Stop Loss to entry price + fee buffer (Breakeven).
         """
         updates = []
         exec_cfg = self.config.execution
-        if exec_cfg.breakeven_atr_trigger <= 0:
-            return updates
 
         for symbol, pos in list(self.positions.items()):
             if pos.size <= 0 or pos.entry_price <= 0:
                 continue
 
-            atr = pos.entry_atr
-            if atr <= 0:
-                continue
+            fee_buffer = pos.entry_price * (exec_cfg.breakeven_buffer_bps / 10000.0)
 
-            # Breakeven Stop-Loss Check
-            if not pos.breakeven_set:
-                trigger_dist = exec_cfg.breakeven_atr_trigger * atr
-                fee_buffer = pos.entry_price * (exec_cfg.breakeven_buffer_bps / 10000.0)
+            # 1. 2-Tier "Lock & Run" Partial Take-Profit (+28 bps)
+            if exec_cfg.tiered_tp_enabled and pos.tp1_price is not None and not pos.tp1_filled:
+                tp1_hit = (pos.mark_price >= pos.tp1_price) if pos.side == "Buy" else (pos.mark_price <= pos.tp1_price)
+                if tp1_hit:
+                    raw_close_qty = pos.size * exec_cfg.tp1_ratio
+                    close_qty = format_qty(pos.symbol, raw_close_qty)
+                    new_sl = round(pos.entry_price + fee_buffer, 4) if pos.side == "Buy" else round(pos.entry_price - fee_buffer, 4)
 
-                if pos.side == "Buy":
-                    # For Long: if mark_price >= entry_price + trigger_dist
-                    if pos.mark_price >= (pos.entry_price + trigger_dist):
-                        new_sl = round(pos.entry_price + fee_buffer, 4)
-                        if pos.stop_loss is None or new_sl > pos.stop_loss:
-                            logger.info(
-                                f"🛡️ [{symbol}] Advancing Stop Loss to Breakeven (+${fee_buffer:.4f} fee buffer): "
-                                f"Mark ${pos.mark_price:.4f} >= Trigger ${pos.entry_price + trigger_dist:.4f}"
-                            )
-                            res = await self.client.set_trading_stop(
+                    if 0 < close_qty < pos.size:
+                        close_side = "Sell" if pos.side == "Buy" else "Buy"
+                        logger.info(
+                            f"🎯 [{symbol}] 2-Tier Lock & Run: Mark ${pos.mark_price:.4f} crossed TP1 ${pos.tp1_price:.4f}. "
+                            f"Closing {close_qty} (50%) to lock profit..."
+                        )
+                        res = await self.client.create_order(
+                            symbol=symbol,
+                            side=close_side,
+                            order_type="Market",
+                            qty=close_qty,
+                            time_in_force="IOC",
+                            reduce_only=True,
+                        )
+                        if res.get("retCode") == 0:
+                            pos.tp1_filled = True
+                            pos.size = max(0.0, round(pos.size - close_qty, 4))
+                            # Advance Stop Loss on remaining half to entry + buffer (risk-free run)
+                            sl_res = await self.client.set_trading_stop(
                                 symbol=symbol,
                                 stop_loss=new_sl,
                             )
-                            if res.get("retCode") == 0:
+                            if sl_res.get("retCode") == 0:
                                 pos.stop_loss = new_sl
                                 pos.breakeven_set = True
-                                updates.append({
-                                    "symbol": symbol,
-                                    "type": "BREAKEVEN_SET",
-                                    "side": pos.side,
-                                    "new_sl": new_sl,
-                                    "mark_price": pos.mark_price,
-                                })
-                            else:
-                                logger.warning(f"Failed to set breakeven stop on {symbol}: {res.get('retMsg')}")
-                elif pos.side == "Sell":
-                    # For Short: if mark_price <= entry_price - trigger_dist
-                    if pos.mark_price <= (pos.entry_price - trigger_dist):
-                        new_sl = round(pos.entry_price - fee_buffer, 4)
-                        if pos.stop_loss is None or new_sl < pos.stop_loss:
-                            logger.info(
-                                f"🛡️ [{symbol}] Advancing Short Stop Loss to Breakeven (-${fee_buffer:.4f} fee buffer): "
-                                f"Mark ${pos.mark_price:.4f} <= Trigger ${pos.entry_price - trigger_dist:.4f}"
-                            )
-                            res = await self.client.set_trading_stop(
-                                symbol=symbol,
-                                stop_loss=new_sl,
-                            )
-                            if res.get("retCode") == 0:
-                                pos.stop_loss = new_sl
-                                pos.breakeven_set = True
-                                updates.append({
-                                    "symbol": symbol,
-                                    "type": "BREAKEVEN_SET",
-                                    "side": pos.side,
-                                    "new_sl": new_sl,
-                                    "mark_price": pos.mark_price,
-                                })
-                            else:
-                                logger.warning(f"Failed to set breakeven stop on {symbol}: {res.get('retMsg')}")
+                            pnl_est = (pos.mark_price - pos.entry_price) * close_qty if pos.side == "Buy" else (pos.entry_price - pos.mark_price) * close_qty
+                            updates.append({
+                                "symbol": symbol,
+                                "type": "TIER1_PROFIT_LOCKED",
+                                "side": pos.side,
+                                "close_qty": close_qty,
+                                "remaining_size": pos.size,
+                                "new_sl": new_sl,
+                                "mark_price": pos.mark_price,
+                                "pnl_estimate": pnl_est,
+                            })
+                        else:
+                            logger.warning(f"Failed to submit Tier 1 partial take profit on {symbol}: {res.get('retMsg')}")
+                    else:
+                        # Qty too small to split on exchange. Advance SL to Breakeven so entire trade is risk-free!
+                        pos.tp1_filled = True
+                        sl_res = await self.client.set_trading_stop(
+                            symbol=symbol,
+                            stop_loss=new_sl,
+                        )
+                        if sl_res.get("retCode") == 0:
+                            pos.stop_loss = new_sl
+                            pos.breakeven_set = True
+                        updates.append({
+                            "symbol": symbol,
+                            "type": "BREAKEVEN_SET",
+                            "side": pos.side,
+                            "new_sl": new_sl,
+                            "mark_price": pos.mark_price,
+                        })
+
+            # 2. Breakeven Stop-Loss Check (via ATR trigger)
+            if not pos.breakeven_set and exec_cfg.breakeven_atr_trigger > 0:
+                atr = pos.entry_atr
+                if atr > 0:
+                    trigger_dist = exec_cfg.breakeven_atr_trigger * atr
+
+                    if pos.side == "Buy":
+                        # For Long: if mark_price >= entry_price + trigger_dist
+                        if pos.mark_price >= (pos.entry_price + trigger_dist):
+                            new_sl = round(pos.entry_price + fee_buffer, 4)
+                            if pos.stop_loss is None or new_sl > pos.stop_loss:
+                                logger.info(
+                                    f"🛡️ [{symbol}] Advancing Stop Loss to Breakeven (+${fee_buffer:.4f} fee buffer): "
+                                    f"Mark ${pos.mark_price:.4f} >= Trigger ${pos.entry_price + trigger_dist:.4f}"
+                                )
+                                res = await self.client.set_trading_stop(
+                                    symbol=symbol,
+                                    stop_loss=new_sl,
+                                )
+                                if res.get("retCode") == 0:
+                                    pos.stop_loss = new_sl
+                                    pos.breakeven_set = True
+                                    updates.append({
+                                        "symbol": symbol,
+                                        "type": "BREAKEVEN_SET",
+                                        "side": pos.side,
+                                        "new_sl": new_sl,
+                                        "mark_price": pos.mark_price,
+                                    })
+                                else:
+                                    logger.warning(f"Failed to set breakeven stop on {symbol}: {res.get('retMsg')}")
+                    elif pos.side == "Sell":
+                        # For Short: if mark_price <= entry_price - trigger_dist
+                        if pos.mark_price <= (pos.entry_price - trigger_dist):
+                            new_sl = round(pos.entry_price - fee_buffer, 4)
+                            if pos.stop_loss is None or new_sl < pos.stop_loss:
+                                logger.info(
+                                    f"🛡️ [{symbol}] Advancing Short Stop Loss to Breakeven (-${fee_buffer:.4f} fee buffer): "
+                                    f"Mark ${pos.mark_price:.4f} <= Trigger ${pos.entry_price - trigger_dist:.4f}"
+                                )
+                                res = await self.client.set_trading_stop(
+                                    symbol=symbol,
+                                    stop_loss=new_sl,
+                                )
+                                if res.get("retCode") == 0:
+                                    pos.stop_loss = new_sl
+                                    pos.breakeven_set = True
+                                    updates.append({
+                                        "symbol": symbol,
+                                        "type": "BREAKEVEN_SET",
+                                        "side": pos.side,
+                                        "new_sl": new_sl,
+                                        "mark_price": pos.mark_price,
+                                    })
+                                else:
+                                    logger.warning(f"Failed to set breakeven stop on {symbol}: {res.get('retMsg')}")
 
         return updates
 

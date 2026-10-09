@@ -56,6 +56,8 @@ class Signal:
     time_in_force: str = "PostOnly"  # "PostOnly" or "IOC"
     leverage: int = 5
     metadata: Dict[str, float] = field(default_factory=dict)
+    tp1_price: Optional[float] = None
+    tp2_price: Optional[float] = None
 
 
 class TimeframeSeries:
@@ -579,13 +581,15 @@ class StrategyEngine:
             return False
 
         # Helper to compute fee-aware bracket distances
-        def get_bracket_distances(price: float, is_5m_wave: bool = True) -> Tuple[float, float]:
+        def get_bracket_distances(price: float, is_5m_wave: bool = True) -> Tuple[float, float, float]:
             base_atr = atr_5m if (is_5m_wave and atr_5m > 0) else atr
             # Enforce minimum profit target of 35 bps to solidly clear all exchange fees
             min_tp_dist = price * 0.0035
             tp_dist = max(tp_atr_mult * base_atr, min_tp_dist)
             sl_dist = max(sl_atr_mult * base_atr, price * 0.0025)
-            return tp_dist, sl_dist
+            tp1_bps = getattr(self.exec_cfg, "tp1_bps", 28.0)
+            tp1_dist = price * (tp1_bps / 10000.0)
+            return tp_dist, sl_dist, tp1_dist
 
         # Retrieve dynamic online learner weights if active
         def get_conviction(base: float, regime_key: str) -> float:
@@ -602,9 +606,10 @@ class StrategyEngine:
                 if is_funding_adverse(side):
                     return None
                 price = best_bid
-                tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+                tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
                 tp_price = round(price + tp_dist, 4)
                 sl_price = round(price - sl_dist, 4)
+                tp1_price = round(price + tp1_dist, 4)
                 conviction = get_conviction(0.85, "trend_pullback")
 
                 return Signal(
@@ -620,15 +625,18 @@ class StrategyEngine:
                     time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
                     leverage=self.risk_cfg.default_leverage,
                     metadata=metrics,
+                    tp1_price=tp1_price,
+                    tp2_price=tp_price,
                 )
             else:
                 side = "Sell"
                 if is_funding_adverse(side):
                     return None
                 price = best_ask
-                tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+                tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
                 tp_price = round(price - tp_dist, 4)
                 sl_price = round(price + sl_dist, 4)
+                tp1_price = round(price - tp1_dist, 4)
                 conviction = get_conviction(0.85, "trend_pullback")
 
                 return Signal(
@@ -644,6 +652,8 @@ class StrategyEngine:
                     time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
                     leverage=self.risk_cfg.default_leverage,
                     metadata=metrics,
+                    tp1_price=tp1_price,
+                    tp2_price=tp_price,
                 )
 
         # 2. Mean-Reversion Scalping in Range/Chop
@@ -763,9 +773,10 @@ class StrategyEngine:
             if is_funding_adverse(side):
                 return None
             price = best_bid
-            tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+            tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
             tp_price = round(price + tp_dist, 4)
             sl_price = round(price - sl_dist, 4)
+            tp1_price = round(price + tp1_dist, 4)
             conviction = get_conviction(0.78, "trend_momentum")
 
             return Signal(
@@ -781,6 +792,8 @@ class StrategyEngine:
                 time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
                 leverage=self.risk_cfg.default_leverage,
                 metadata=metrics,
+                tp1_price=tp1_price,
+                tp2_price=tp_price,
             )
 
         elif regime == MarketRegime.BEAR_TREND:
@@ -788,9 +801,10 @@ class StrategyEngine:
             if is_funding_adverse(side):
                 return None
             price = best_ask
-            tp_dist, sl_dist = get_bracket_distances(price, is_5m_wave=True)
+            tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
             tp_price = round(price - tp_dist, 4)
             sl_price = round(price + sl_dist, 4)
+            tp1_price = round(price - tp1_dist, 4)
             conviction = get_conviction(0.78, "trend_momentum")
 
             return Signal(
@@ -806,6 +820,8 @@ class StrategyEngine:
                 time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
                 leverage=self.risk_cfg.default_leverage,
                 metadata=metrics,
+                tp1_price=tp1_price,
+                tp2_price=tp_price,
             )
 
         return None

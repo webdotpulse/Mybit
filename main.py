@@ -28,7 +28,7 @@ from config import (
     load_credentials,
     save_config,
 )
-from risk_manager import Position, RiskManager, _to_float, _to_int
+from risk_manager import Position, RiskManager, _to_float, _to_int, format_qty
 from strategy import MarketRegime, Signal, StrategyEngine, TimeframeSeries
 from telegram_notifier import TelegramNotifier
 from trade_journal import ParameterAutoTuner, TradeJournal, TradeRecord
@@ -237,6 +237,8 @@ class TradingEngine:
         self._background_tasks.append(asyncio.create_task(self._strategy_decision_loop()))
         self._background_tasks.append(asyncio.create_task(self._position_guardian_loop()))
         self._background_tasks.append(asyncio.create_task(self._status_publisher_loop()))
+        if self.config.strategy.auto_scan_symbols:
+            self._background_tasks.append(asyncio.create_task(self._volatility_scanner_loop()))
 
         logger.info("Trading engine execution loops active. Awaiting regime opportunities...")
         while self._running:
@@ -245,23 +247,38 @@ class TradingEngine:
     async def _position_guardian_loop(self) -> None:
         """
         Active Position Guardian:
-        1. Checks unrealized profits and advances Stop Loss to Breakeven (+ fees) at +0.6x ATR.
+        1. Evaluates 2-Tier Lock & Run profit taking (+28 bps partial lock) and Breakeven advancement.
         2. Detects stagnant scalps open longer than stagnant_exit_mins and liquidates them.
         """
         while self._running:
             try:
-                # 1. Evaluate Breakeven and Trailing stops
+                # 1. Evaluate Tier 1 Partial Take-Profit and Breakeven stops
                 stop_updates = await self.risk_manager.evaluate_position_stops()
                 for update in stop_updates:
                     sym = update["symbol"]
-                    new_sl = update["new_sl"]
-                    await self.telegram.send_message(
-                        f"🛡️ *Breakeven Protected: {sym}*\n"
-                        f"• Side: `{update['side']}`\n"
-                        f"• Stop-Loss Advanced to: `${new_sl}`\n"
-                        f"• Current Mark: `${update['mark_price']:.4f}`\n"
-                        f"• Status: Risk-free trade locked in!"
-                    )
+                    update_type = update.get("type")
+                    if update_type == "TIER1_PROFIT_LOCKED":
+                        close_qty = update.get("close_qty")
+                        new_sl = update.get("new_sl")
+                        pnl_est = update.get("pnl_estimate", 0.0)
+                        pnl_sign = "+" if pnl_est >= 0 else ""
+                        await self.telegram.send_message(
+                            f"🎯 *2-Tier Lock & Run Banked: {sym}*\n"
+                            f"• Side: `{update['side']}` | Banked 50%: `{close_qty}`\n"
+                            f"• Banked Profit (Est): `{pnl_sign}${pnl_est:.4f}`\n"
+                            f"• Stop-Loss Locked at: `${new_sl}` (Entry + Fee Buffer)\n"
+                            f"• Remaining 50% riding wave risk-free!"
+                        )
+                        asyncio.create_task(self._sync_closed_pnl(sym))
+                    else:
+                        new_sl = update["new_sl"]
+                        await self.telegram.send_message(
+                            f"🛡️ *Breakeven Protected: {sym}*\n"
+                            f"• Side: `{update['side']}`\n"
+                            f"• Stop-Loss Advanced to: `${new_sl}`\n"
+                            f"• Current Mark: `${update['mark_price']:.4f}`\n"
+                            f"• Status: Risk-free trade locked in!"
+                        )
 
                 # 2. Check for stagnant positions
                 stagnant_closed = await self.risk_manager.check_stagnant_positions()
@@ -437,6 +454,9 @@ class TradingEngine:
                 opened_at = existing.opened_at if (existing and existing.opened_at > 0) else float(ctx.get("placed_at", time.time()))
                 breakeven_set = existing.breakeven_set if existing else False
                 entry_features = existing.entry_features if existing else ctx
+                tp1_price = existing.tp1_price if (existing and existing.tp1_price) else ctx.get("tp1_price")
+                tp1_filled = existing.tp1_filled if existing else False
+                original_size = existing.original_size if (existing and existing.original_size > 0) else (ctx.get("size") or size)
 
                 self.risk_manager.positions[symbol] = Position(
                     symbol=symbol,
@@ -453,6 +473,9 @@ class TradingEngine:
                     breakeven_set=breakeven_set,
                     opened_at=opened_at,
                     entry_features=entry_features,
+                    tp1_price=tp1_price,
+                    tp1_filled=tp1_filled,
+                    original_size=original_size,
                 )
             else:
                 if symbol in self.risk_manager.positions:
@@ -621,6 +644,7 @@ class TradingEngine:
                     "side": sig.side,
                     "price": sig.price,
                     "qty": qty,
+                    "size": qty,
                     "placed_at": time.time(),
                     "regime": sig.regime.value,
                     "conviction": sig.conviction,
@@ -629,6 +653,8 @@ class TradingEngine:
                     "vwap_delta": sig.price - sig.metadata.get("vwap", sig.price),
                     "ofi": sig.metadata.get("ofi", 0.0),
                     "r2": sig.metadata.get("r2_1m", 0.0),
+                    "tp1_price": sig.tp1_price,
+                    "tp2_price": sig.tp2_price,
                 }
                 self._position_context[sig.symbol] = ctx
                 self._order_context[order_id] = ctx
@@ -664,6 +690,7 @@ class TradingEngine:
                 "side": sig.side,
                 "price": sig.price,
                 "qty": qty,
+                "size": qty,
                 "placed_at": time.time(),
                 "regime": sig.regime.value,
                 "conviction": sig.conviction,
@@ -672,6 +699,8 @@ class TradingEngine:
                 "vwap_delta": sig.price - sig.metadata.get("vwap", sig.price),
                 "ofi": sig.metadata.get("ofi", 0.0),
                 "r2": sig.metadata.get("r2_1m", 0.0),
+                "tp1_price": sig.tp1_price,
+                "tp2_price": sig.tp2_price,
             }
             self._position_context[sig.symbol] = ctx
             self._order_context[order_id] = ctx
@@ -720,22 +749,127 @@ class TradingEngine:
 
     def _format_qty(self, symbol: str, raw_qty: float) -> float:
         """Rounds quantity to symbol lot size precision on Bybit V5."""
-        sym = symbol.upper()
-        if "BTC" in sym:
-            return max(0.001, round(raw_qty, 3))
-        elif "ETH" in sym:
-            return max(0.01, round(raw_qty, 2))
-        elif "SOL" in sym or "AVAX" in sym or "LINK" in sym:
-            return max(0.1, round(raw_qty, 1))
-        elif "SUI" in sym:
-            # Bybit SUIUSDT linear contract: minOrderQty = 10, qtyStep = 10
-            steps = max(1, int(round(raw_qty / 10.0)))
-            return float(steps * 10)
-        elif "DOGE" in sym or "ADA" in sym or "TRX" in sym:
-            return float(max(1, int(round(raw_qty))))
-        elif "XRP" in sym:
-            return max(0.1, round(raw_qty, 1))
-        return round(raw_qty, 2)
+        return format_qty(symbol, raw_qty)
+
+    async def _volatility_scanner_loop(self) -> None:
+        """Periodic background task executing the Autonomous Volatility & Volume Scanner."""
+        interval_sec = max(60, int(self.config.strategy.scanner_interval_mins * 60))
+        # Initial sleep of 20s to allow startup routines to complete
+        await asyncio.sleep(20)
+        while self._running:
+            try:
+                await self._scan_and_update_symbols()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in volatility scanner loop: {e}")
+            await asyncio.sleep(interval_sec)
+
+    async def _scan_and_update_symbols(self) -> None:
+        """
+        Autonomous Volatility & Volume Scanner:
+        Queries Bybit V5 market tickers, filters liquid linear perpetuals (turnover > $30M),
+        ranks by combined 24h volatility & volume momentum, and dynamically rotates active symbols.
+        """
+        if not self.config.strategy.auto_scan_symbols:
+            return
+
+        try:
+            logger.info("🔍 [SCANNER] Scanning Bybit linear perpetuals for high-volatility & liquid pairs...")
+            tickers = await self.client.get_market_tickers(category="linear")
+            if not tickers:
+                logger.warning("Scanner received empty ticker response from Bybit.")
+                return
+
+            candidates = []
+            min_turnover = float(self.config.strategy.scanner_min_turnover_usd)
+            excluded = {"USDCUSDT", "FDUSDUSDT", "USDEUSDT", "USDYUSDT", "BUSDUSDT"}
+
+            for t in tickers:
+                sym = t.get("symbol", "")
+                if not sym.endswith("USDT") or sym in excluded:
+                    continue
+
+                turnover = _to_float(t.get("turnover24h"))
+                if turnover < min_turnover:
+                    continue
+
+                last_price = _to_float(t.get("lastPrice"))
+                if last_price <= 0:
+                    continue
+
+                high = _to_float(t.get("highPrice24h"))
+                low = _to_float(t.get("lowPrice24h"))
+                price_pct = abs(_to_float(t.get("price24hPcnt")))
+                range_pct = ((high - low) / last_price) if last_price > 0 else 0.0
+                volatility_score = max(price_pct, range_pct)
+
+                score = volatility_score * (turnover ** 0.3)
+                candidates.append({
+                    "symbol": sym,
+                    "turnover": turnover,
+                    "volatility": volatility_score,
+                    "last_price": last_price,
+                    "score": score,
+                })
+
+            if not candidates:
+                logger.info(f"No candidates satisfied turnover >= ${min_turnover:,.0f}. Preserving current symbols.")
+                return
+
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            top_n = self.config.strategy.scanner_top_n
+            selected_symbols = [c["symbol"] for c in candidates[:top_n]]
+
+            # Ensure any active open position symbols are preserved so we never orphan an active trade
+            for open_sym in self.risk_manager.positions.keys():
+                if open_sym not in selected_symbols:
+                    selected_symbols.append(open_sym)
+
+            current_symbols = list(self.config.strategy.symbols)
+            if set(selected_symbols) != set(current_symbols):
+                added = [s for s in selected_symbols if s not in current_symbols]
+                removed = [s for s in current_symbols if s not in selected_symbols]
+                logger.info(
+                    f"🔄 [VOLATILITY SCANNER] Symbol rotation: Old: {current_symbols} -> "
+                    f"New: {selected_symbols} (Added: {added}, Removed: {removed})"
+                )
+
+                # Initialize leverage, klines, and subscriptions for new pairs
+                for sym in added:
+                    if self.config.trading_mode.value == "linear":
+                        try:
+                            await self.client.set_leverage(sym, self.config.risk.default_leverage)
+                        except Exception as e:
+                            logger.debug(f"Failed to set leverage for {sym}: {e}")
+
+                    for tf in self.config.strategy.timeframes:
+                        try:
+                            klines = await self.client.get_klines(symbol=sym, interval=tf, limit=100)
+                            for k in klines:
+                                self.strategy.update_kline(sym, tf, k)
+                        except Exception as e:
+                            logger.debug(f"Failed to prime klines for {sym} {tf}: {e}")
+
+                    # Subscribe to orderbook and klines
+                    topics = [f"orderbook.50.{sym}"]
+                    for tf in self.config.strategy.timeframes:
+                        clean_tf = tf.replace("m", "")
+                        topics.append(f"kline.{clean_tf}.{sym}")
+                    await self.client.add_public_subscriptions(topics)
+
+                self.config.strategy.symbols = selected_symbols
+                await self.telegram.send_message(
+                    f"📡 *Autonomous Volatility Scanner Rotated Pairs*\n"
+                    f"• Active Universe: `{', '.join(selected_symbols)}`\n"
+                    f"• Top Liquid Candidates: `{', '.join(added or ['None'])}`\n"
+                    f"• Selection: Top 24h Volatility + Turnover > ${min_turnover / 1_000_000:.0f}M"
+                )
+            else:
+                logger.debug(f"Scanner confirmed active universe optimal: {selected_symbols}")
+
+        except Exception as e:
+            logger.error(f"Error in volatility scanner: {e}")
 
     async def _reconciliation_loop(self) -> None:
         """Active 10-Second State Reconciliation Loop."""
