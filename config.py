@@ -71,11 +71,11 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
                 "symbols": active_symbols,
                 "max_open_positions": 3,
                 "max_daily_risk_pct": 3.5,
-                "min_position_equity_pct": 12.0,
-                "max_position_equity_pct": 20.0,
-                "default_leverage": 10,
+                "min_position_equity_pct": 3.0,
+                "max_position_equity_pct": 6.0,
+                "default_leverage": 5,
                 "auto_tuning_interval": 20,
-                "description": f"Growth Tier (${int(equity)} USD). Highly liquid pairs, max 3 concurrent positions, 3.5% daily risk."
+                "description": f"Growth Tier (${int(equity)} USD). Highly liquid pairs, max 3 concurrent positions, 3.5% daily risk, 5x leverage."
             }
         )
     elif equity < 10000.0:
@@ -160,7 +160,7 @@ class RiskConfig(BaseModel):
         description="ATR volatility spike kill switch threshold in standard deviations"
     )
     default_leverage: int = Field(
-        default=10,
+        default=5,
         ge=1,
         le=50,
         description="Default position leverage for linear perpetuals"
@@ -192,7 +192,7 @@ class ExecutionConfig(BaseModel):
         description="Timeout waiting for maker fill before recalculating or aggressive IOC"
     )
     bracket_tp_atr_mult: float = Field(
-        default=1.35,
+        default=1.40,
         ge=0.4,
         le=5.0,
         description="ATR multiplier for native Take Profit bracket"
@@ -204,7 +204,7 @@ class ExecutionConfig(BaseModel):
         description="ATR multiplier for high-conviction breakout Take Profit bracket"
     )
     bracket_sl_atr_mult: float = Field(
-        default=0.90,
+        default=0.80,
         ge=0.2,
         le=3.0,
         description="ATR multiplier for native Stop Loss bracket"
@@ -214,7 +214,7 @@ class ExecutionConfig(BaseModel):
         description="Enable dynamic trailing stop adjustment as position moves in profit"
     )
     tiered_tp_enabled: bool = Field(
-        default=True,
+        default=False,
         description="Enable 2-tier Lock & Run take-profit (banks 50% quick, rides runner risk-free)"
     )
     tp1_ratio: float = Field(
@@ -224,28 +224,28 @@ class ExecutionConfig(BaseModel):
         description="Ratio of position size closed at Tier 1 Take Profit"
     )
     tp1_bps: float = Field(
-        default=28.0,
+        default=50.0,
         ge=15.0,
-        le=50.0,
+        le=100.0,
         description="Target basis points for Tier 1 quick profit lock"
     )
     breakeven_atr_trigger: float = Field(
-        default=0.50,
+        default=1.0,
         ge=0.2,
         le=3.0,
         description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
     )
     breakeven_buffer_bps: float = Field(
-        default=10.0,
+        default=12.0,
         ge=0.0,
         le=50.0,
         description="Buffer in basis points above entry price when setting Breakeven Stop Loss (covers round-trip fees + slippage)"
     )
     stagnant_exit_mins: int = Field(
-        default=15,
-        ge=2,
+        default=0,
+        ge=0,
         le=240,
-        description="Holding minutes after which a stagnant scalp position is evaluated for exit"
+        description="Holding minutes after which a stagnant scalp position is evaluated for exit (0 to disable)"
     )
     stagnant_atr_threshold: float = Field(
         default=0.25,
@@ -327,8 +327,12 @@ class StrategyConfig(BaseModel):
         description="Number of closed trades between parameter auto-tuning passes"
     )
     auto_scan_symbols: bool = Field(
-        default=True,
+        default=False,
         description="Autonomously scan and trade top volume/volatility Bybit pairs"
+    )
+    mean_reversion_enabled: bool = Field(
+        default=False,
+        description="Enable counter-trend mean reversion trades in chop (disabled by default to avoid fee bleed)"
     )
     scanner_interval_mins: int = Field(
         default=15,

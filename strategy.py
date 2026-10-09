@@ -528,7 +528,7 @@ class StrategyEngine:
             return MarketRegime.BEAR_TREND, metrics
 
         # 4. Mean-Reversion Scalp in Range / Low ADX Chop (ADX < 24)
-        if adx < 24 or abs(slope_5m) < 0.00005:
+        if getattr(self.strat_cfg, "mean_reversion_enabled", False) and (adx < 24 or abs(slope_5m) < 0.00005):
             if pct_b <= 0.15 and rsi_1m <= 38 and ofi >= 0:
                 metrics["range_side"] = 1.0  # Buy
                 return MarketRegime.MEAN_REVERSION_RANGE, metrics
@@ -599,11 +599,11 @@ class StrategyEngine:
         # Helper to compute fee-aware bracket distances
         def get_bracket_distances(price: float, is_5m_wave: bool = True) -> Tuple[float, float, float]:
             base_atr = atr_5m if (is_5m_wave and atr_5m > 0) else atr
-            # Enforce minimum profit target of 35 bps to solidly clear all exchange fees
-            min_tp_dist = price * 0.0035
+            # Enforce minimum profit target of 40 bps to solidly clear all exchange fees
+            min_tp_dist = price * 0.0040
             tp_dist = max(tp_atr_mult * base_atr, min_tp_dist)
             sl_dist = max(sl_atr_mult * base_atr, price * 0.0025)
-            tp1_bps = getattr(self.exec_cfg, "tp1_bps", 28.0)
+            tp1_bps = getattr(self.exec_cfg, "tp1_bps", 50.0)
             tp1_dist = price * (tp1_bps / 10000.0)
             return tp_dist, sl_dist, tp1_dist
 
