@@ -370,9 +370,25 @@ class StrategyEngine:
         half_kelly = kelly * self.strat_cfg.kelly_scale
         return max(min_pct, min(max_pct, half_kelly))
 
+    def ensure_symbol(self, symbol: str) -> None:
+        """Ensures timeframe series structures exist for the given symbol."""
+        if symbol not in self.series:
+            self.series[symbol] = {
+                tf: TimeframeSeries(symbol, tf) for tf in self.strat_cfg.timeframes
+            }
+            # Also support non-'m' keyed lookups (e.g. '1', '5', '15')
+            for tf in list(self.strat_cfg.timeframes):
+                clean_tf = tf.replace("m", "")
+                if clean_tf not in self.series[symbol]:
+                    self.series[symbol][clean_tf] = self.series[symbol][tf]
+
     def update_kline(self, symbol: str, interval: str, kline_raw: Dict[str, Any]) -> None:
         """Ingests live kline update into the series."""
-        if symbol not in self.series or interval not in self.series[symbol]:
+        self.ensure_symbol(symbol)
+        clean_tf = interval.replace("m", "")
+        series_map = self.series[symbol]
+        series = series_map.get(interval) or series_map.get(f"{clean_tf}m") or series_map.get(clean_tf)
+        if not series:
             return
 
         bar = Bar(
@@ -384,7 +400,7 @@ class StrategyEngine:
             volume=float(kline_raw.get("volume", 0)),
             turnover=float(kline_raw.get("turnover", 0)),
         )
-        self.series[symbol][interval].add_or_update_bar(bar)
+        series.add_or_update_bar(bar)
 
     def classify_regime(
         self,

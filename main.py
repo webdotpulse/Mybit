@@ -302,15 +302,19 @@ class TradingEngine:
         """Ingests live kline updates into the feature engine."""
         self.strategy.update_kline(symbol, interval, kline)
         # Check for volatility spike on 1m bars
-        if interval in ("1", "1m"):
-            atr = self.strategy.series[symbol]["1m"].calculate_atr()
-            if atr > 0:
-                is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr)
-                if is_spike:
-                    await self.telegram.send_circuit_breaker_alert(
-                        "Volatility Spike Kill Switch",
-                        f"Extreme ATR spike detected on {symbol} (ATR={atr:.4f}). Halting new orders.",
-                    )
+        clean_int = interval.replace("m", "")
+        if clean_int == "1":
+            sym_series = self.strategy.series.get(symbol, {})
+            tf_1m = sym_series.get("1m") or sym_series.get("1")
+            if tf_1m:
+                atr = tf_1m.calculate_atr()
+                if atr > 0:
+                    is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr)
+                    if is_spike:
+                        await self.telegram.send_circuit_breaker_alert(
+                            "Volatility Spike Kill Switch",
+                            f"Extreme ATR spike detected on {symbol} (ATR={atr:.4f}). Halting new orders.",
+                        )
 
     async def _on_execution_update(self, exec_data: Dict[str, Any]) -> None:
         """Processes real-time fills, logs trade metrics, and triggers PnL synchronization."""
