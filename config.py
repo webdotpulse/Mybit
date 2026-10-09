@@ -214,7 +214,7 @@ class ExecutionConfig(BaseModel):
         description="Enable dynamic trailing stop adjustment as position moves in profit"
     )
     tiered_tp_enabled: bool = Field(
-        default=False,
+        default=True,
         description="Enable 2-tier Lock & Run take-profit (banks 50% quick, rides runner risk-free)"
     )
     tp1_ratio: float = Field(
@@ -230,7 +230,7 @@ class ExecutionConfig(BaseModel):
         description="Target basis points for Tier 1 quick profit lock"
     )
     breakeven_atr_trigger: float = Field(
-        default=1.0,
+        default=1.2,
         ge=0.2,
         le=3.0,
         description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
@@ -240,6 +240,10 @@ class ExecutionConfig(BaseModel):
         ge=0.0,
         le=50.0,
         description="Buffer in basis points above entry price when setting Breakeven Stop Loss (covers round-trip fees + slippage)"
+    )
+    lead_lag_filter: bool = Field(
+        default=True,
+        description="Enable cross-asset BTC lead-lag momentum filter for altcoins"
     )
     stagnant_exit_mins: int = Field(
         default=0,
@@ -327,7 +331,7 @@ class StrategyConfig(BaseModel):
         description="Number of closed trades between parameter auto-tuning passes"
     )
     auto_scan_symbols: bool = Field(
-        default=False,
+        default=True,
         description="Autonomously scan and trade top volume/volatility Bybit pairs"
     )
     mean_reversion_enabled: bool = Field(

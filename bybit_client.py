@@ -43,6 +43,10 @@ class OrderBookL2:
         self.prev_best_ask_p: float = 0.0
         self.prev_best_ask_v: float = 0.0
         self.ofi: float = 0.0  # Order flow imbalance
+        self.deep_ofi: float = 0.0  # Depth-weighted multi-level OFI
+        self.depth_skew: float = 0.0  # Orderbook volume skew (-1.0 to +1.0)
+        self.prev_depth_bids: List[Tuple[float, float]] = []
+        self.prev_depth_asks: List[Tuple[float, float]] = []
 
     def apply_snapshot(self, data: Dict[str, Any]) -> None:
         """Initializes order book from snapshot."""
@@ -71,7 +75,7 @@ class OrderBookL2:
         self._update_top_of_book()
 
     def _update_top_of_book(self) -> None:
-        """Calculates top of book and incremental Order Flow Imbalance (OFI)."""
+        """Calculates top of book, Multi-Level Deep OFI, and orderbook volume skew."""
         if not self.bids or not self.asks:
             return
 
@@ -103,6 +107,42 @@ class OrderBookL2:
 
             # Imbalance = delta_bid - delta_ask
             self.ofi = delta_bid - delta_ask
+
+            # Multi-Level Deep OFI across top 5 depth levels with harmonic weighting (1/k)
+            curr_bids = [(p, self.bids[p]) for p in sorted_bids[:5]]
+            curr_asks = [(p, self.asks[p]) for p in sorted_asks[:5]]
+
+            if self.prev_depth_bids and self.prev_depth_asks:
+                weighted_ofi = 0.0
+                max_levels = min(len(curr_bids), len(self.prev_depth_bids), len(curr_asks), len(self.prev_depth_asks), 5)
+                for k in range(max_levels):
+                    w = 1.0 / (k + 1)
+                    cb_p, cb_v = curr_bids[k]
+                    pb_p, pb_v = self.prev_depth_bids[k]
+                    ca_p, ca_v = curr_asks[k]
+                    pa_p, pa_v = self.prev_depth_asks[k]
+
+                    b_delta = cb_v if cb_p > pb_p else (cb_v - pb_v if cb_p == pb_p else -pb_v)
+                    a_delta = ca_v if ca_p < pa_p else (ca_v - pa_v if ca_p == pa_p else -pa_v)
+                    weighted_ofi += w * (b_delta - a_delta)
+                self.deep_ofi = round(weighted_ofi, 4)
+            else:
+                self.deep_ofi = self.ofi
+
+            self.prev_depth_bids = curr_bids
+            self.prev_depth_asks = curr_asks
+        else:
+            self.prev_depth_bids = [(p, self.bids[p]) for p in sorted_bids[:5]]
+            self.prev_depth_asks = [(p, self.asks[p]) for p in sorted_asks[:5]]
+            self.deep_ofi = 0.0
+
+        # Calculate 5-level OrderBook Depth Skew: (BidVol - AskVol) / (BidVol + AskVol)
+        top_bid_vol, top_ask_vol = self.get_cumulative_volume(levels=5)
+        tot_vol = top_bid_vol + top_ask_vol
+        if tot_vol > 0:
+            self.depth_skew = round((top_bid_vol - top_ask_vol) / tot_vol, 4)
+        else:
+            self.depth_skew = 0.0
 
         self.prev_best_bid_p = best_bid_p
         self.prev_best_bid_v = best_bid_v

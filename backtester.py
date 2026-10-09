@@ -313,7 +313,7 @@ class QuantitativeBacktester:
                         open_pos["breakeven_set"] = True
 
                 # C. Check Stagnant Position Timeout
-                if not exit_occurred and duration_mins >= self.config.execution.stagnant_exit_mins:
+                if not exit_occurred and self.config.execution.stagnant_exit_mins > 0 and duration_mins >= self.config.execution.stagnant_exit_mins:
                     price_delta = abs(bar.close - entry_px)
                     if price_delta <= (self.config.execution.stagnant_atr_threshold * atr):
                         exit_price = bar.close
@@ -459,11 +459,11 @@ class QuantitativeBacktester:
         # 3. Compute Comprehensive Performance Statistics
         # ----------------------------------------------------
         total_trades = len(closed_trades)
-        breakevens = [t for t in closed_trades if t.exit_reason == "BREAKEVEN" or abs(t.pnl) <= 0.01]
-        wins = [t for t in closed_trades if t.pnl > 0.01 and t.exit_reason != "BREAKEVEN"]
-        losses = [t for t in closed_trades if t.pnl < -0.01 and t.exit_reason != "BREAKEVEN"]
+        breakevens = [t for t in closed_trades if abs(t.pnl) <= 0.0005 or (t.exit_reason == "BREAKEVEN" and t.pnl <= 0)]
+        wins = [t for t in closed_trades if t.pnl > 0.0005]
+        losses = [t for t in closed_trades if t.pnl < -0.0005 and t not in breakevens]
 
-        # Win rate excludes pure breakeven scratch trades for accurate statistical edge
+        # Win rate counts winning trades over all non-scratch decisive trades
         decisive_trades = len(wins) + len(losses)
         win_rate = (len(wins) / decisive_trades) * 100.0 if decisive_trades > 0 else 0.0
         sum_wins = sum(t.pnl for t in wins)
@@ -597,11 +597,21 @@ def main() -> None:
     parser.add_argument("--bars", type=int, default=3000, help="Number of 1m bars to fetch (default: 3000 ~ 2.1 days)")
     parser.add_argument("--capital", type=float, default=100.0, help="Starting capital pool in USD (default: 100.0)")
     parser.add_argument("--leverage", type=int, default=5, help="Leverage multiplier (default: 5)")
+    parser.add_argument("--tp-mult", type=float, default=1.4, help="Take profit ATR multiplier (default: 1.4)")
+    parser.add_argument("--sl-mult", type=float, default=0.8, help="Stop loss ATR multiplier (default: 0.8)")
+    parser.add_argument("--be-trigger", type=float, default=1.2, help="Breakeven ATR trigger (default: 1.2)")
+    parser.add_argument("--tp1-bps", type=float, default=50.0, help="Tier 1 take profit in bps (default: 50.0)")
+    parser.add_argument("--no-tiered-tp", action="store_true", help="Disable 2-Tier Lock & Run take-profit")
     args = parser.parse_args()
 
     config = AppConfig()
     config.risk.allocated_capital_usd = args.capital
     config.risk.default_leverage = args.leverage
+    config.execution.bracket_tp_atr_mult = args.tp_mult
+    config.execution.bracket_sl_atr_mult = args.sl_mult
+    config.execution.breakeven_atr_trigger = args.be_trigger
+    config.execution.tp1_bps = args.tp1_bps
+    config.execution.tiered_tp_enabled = not args.no_tiered_tp
 
     bars = HistoricalDataFetcher.fetch_klines(
         symbol=args.symbol,

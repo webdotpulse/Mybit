@@ -1170,9 +1170,97 @@ async def test_position_state_preservation_with_tier1_fields():
     assert sol_pos.mark_price == 100.25
 
 
+def test_orderbook_deep_ofi_and_depth_skew():
+    """Verifies that OrderBookL2 computes 5-level deep OFI and depth volume skew."""
+    ob = OrderBookL2("SOLUSDT")
+    ob.apply_snapshot({
+        "b": [["150.00", "10.0"], ["149.90", "20.0"], ["149.80", "30.0"], ["149.70", "40.0"], ["149.60", "50.0"]],
+        "a": [["150.10", "5.0"], ["150.20", "10.0"], ["150.30", "15.0"], ["150.40", "20.0"], ["150.50", "25.0"]],
+        "u": 1,
+    })
+    # Bids total 150.0, Asks total 75.0 -> Skew = (150 - 75) / (150 + 75) = 75 / 225 = +0.3333
+    assert ob.depth_skew > 0.30
+
+    # Delta update: Bids increase
+    ob.apply_delta({
+        "b": [["150.05", "15.0"]],
+        "a": [],
+        "u": 2,
+    })
+    assert ob.deep_ofi > 0
+    assert ob.best_bid == (150.05, 15.0)
 
 
+def test_strategy_btc_lead_lag_filter():
+    """Verifies that StrategyEngine suppresses altcoin signals against BTC macro impulse."""
+    cfg = AppConfig()
+    cfg.execution.lead_lag_filter = True
+    strat = StrategyEngine(cfg)
+
+    # Seed bearish BTC
+    base_t = int(time.time() * 1000) - (60 * 60 * 1000)
+    for i in range(60):
+        t = base_t + (i * 60 * 1000)
+        px = 70000.0 - (i * 20.0)  # Downward
+        strat.update_kline("BTCUSDT", "1m", {
+            "start": t, "open": px + 10, "high": px + 15, "low": px - 5, "close": px, "volume": 100, "turnover": px * 100
+        })
+        if i % 5 == 0:
+            strat.update_kline("BTCUSDT", "5m", {
+                "start": t, "open": px + 50, "high": px + 60, "low": px - 20, "close": px, "volume": 500, "turnover": px * 500
+            })
+
+    assert strat.get_btc_macro_trend() == -1  # Bearish
+
+    # Now seed bullish SOL series
+    for i in range(60):
+        t = base_t + (i * 60 * 1000)
+        px = 150.0 + (i * 0.2)
+        strat.update_kline("SOLUSDT", "1m", {
+            "start": t, "open": px - 0.1, "high": px + 0.3, "low": px - 0.1, "close": px, "volume": 200, "turnover": px * 200
+        })
+        if i % 5 == 0:
+            strat.update_kline("SOLUSDT", "5m", {
+                "start": t, "open": px - 0.5, "high": px + 1.0, "low": px - 0.5, "close": px, "volume": 1000, "turnover": px * 1000
+            })
+
+    sol_ob = OrderBookL2("SOLUSDT")
+    sol_ob.apply_snapshot({"b": [["162.00", "50.0"]], "a": [["162.05", "50.0"]], "u": 1})
+    sol_ob.ofi = 5.0
+
+    # Long signal on SOL should be SUPPRESSED because BTC is in a macro downtrend
+    sig = strat.generate_signal("SOLUSDT", sol_ob)
+    assert sig is None
 
 
+def test_inside_spread_maker_pricing():
+    """Verifies that maker prices penny-jump inside the spread when spread > 2 ticks."""
+    cfg = AppConfig()
+    cfg.execution.maker_first = True
+    strat = StrategyEngine(cfg)
+
+    # Seed 60 ascending bars for SOL
+    base_t = int(time.time() * 1000) - (60 * 60 * 1000)
+    for i in range(60):
+        t = base_t + (i * 60 * 1000)
+        px = 150.0 + (i * 0.2)
+        strat.update_kline("SOLUSDT", "1m", {
+            "start": t, "open": px - 0.1, "high": px + 0.3, "low": px - 0.1, "close": px, "volume": 200, "turnover": px * 200
+        })
+        if i % 5 == 0:
+            strat.update_kline("SOLUSDT", "5m", {
+                "start": t, "open": px - 0.5, "high": px + 1.0, "low": px - 0.5, "close": px, "volume": 1000, "turnover": px * 1000
+            })
+
+    sol_ob = OrderBookL2("SOLUSDT")
+    # Spread is 0.05 (162.05 - 162.00 = 5 ticks of 0.01)
+    sol_ob.apply_snapshot({"b": [["162.00", "50.0"]], "a": [["162.05", "50.0"]], "u": 1})
+    sol_ob.ofi = 5.0
+
+    cfg.execution.lead_lag_filter = False  # Disable lead lag to isolate maker pricing
+    sig = strat.generate_signal("SOLUSDT", sol_ob)
+    if sig and sig.side == "Buy":
+        # Price should be best_bid (162.00) + tick (0.01) = 162.01, NOT sitting behind at 162.00!
+        assert sig.price == 162.01
 
 

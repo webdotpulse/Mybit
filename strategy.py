@@ -370,6 +370,30 @@ class StrategyEngine:
         half_kelly = kelly * self.strat_cfg.kelly_scale
         return max(min_pct, min(max_pct, half_kelly))
 
+    def get_btc_macro_trend(self) -> int:
+        """
+        Returns BTC market direction: +1 (Bullish), -1 (Bearish), 0 (Neutral).
+        Used as a high-conviction lead-lag filter for altcoins.
+        """
+        btc_map = self.series.get("BTCUSDT")
+        if not btc_map:
+            return 0
+        btc_1m = btc_map.get("1m") or btc_map.get("1")
+        btc_5m = btc_map.get("5m") or btc_map.get("5")
+        if not btc_1m or len(btc_1m.bars) < 20:
+            return 0
+        btc_close = btc_1m.bars[-1].close
+        btc_vwap = btc_1m.calculate_vwap(60)
+        btc_ema9 = btc_1m.calculate_ema(9)
+        btc_ema21 = btc_1m.calculate_ema(21)
+        slope_5m = btc_5m.calculate_linreg(8)[0] if (btc_5m and len(btc_5m.bars) >= 8) else 0.0
+
+        if btc_close > btc_vwap and btc_ema9 > btc_ema21 and slope_5m >= 0:
+            return 1
+        elif btc_close < btc_vwap and btc_ema9 < btc_ema21 and slope_5m <= 0:
+            return -1
+        return 0
+
     def ensure_symbol(self, symbol: str) -> None:
         """Ensures timeframe series structures exist for the given symbol."""
         if symbol not in self.series:
@@ -451,8 +475,10 @@ class StrategyEngine:
             tf_5m.calculate_ema(self.strat_cfg.ema_slow) if (tf_5m and len(tf_5m.bars) > 0) else ema50
         )
 
-        # OFI from OrderBook L2
+        # OFI and Depth Skew from OrderBook L2
         ofi = orderbook.ofi if orderbook else 0.0
+        deep_ofi = getattr(orderbook, "deep_ofi", ofi) if orderbook else ofi
+        depth_skew = getattr(orderbook, "depth_skew", 0.0) if orderbook else 0.0
 
         # Calculate historical ATR mean for expansion detection
         recent_bars = list(tf_1m.bars)[-60:]
@@ -474,6 +500,8 @@ class StrategyEngine:
             "vwap": vwap,
             "vwap_5m": vwap_5m,
             "ofi": ofi,
+            "deep_ofi": deep_ofi,
+            "depth_skew": depth_skew,
             "mean_tr": mean_tr,
             "adx": adx,
             "plus_di": plus_di,
@@ -497,16 +525,21 @@ class StrategyEngine:
         if is_atr_expansion and volume_ok and abs(ofi) > 0:
             return MarketRegime.VOLATILITY_EXPANSION, metrics
 
+        # ADX trend confirmation
+        adx_ok = (adx >= self.exec_cfg.adx_threshold) if self.exec_cfg.adx_filter else True
+        is_bull_skew = (depth_skew >= -0.25)
+        is_bear_skew = (depth_skew <= 0.25)
+
         # 2. High-Probability Trend Pullback (Buy Dips in Macro Uptrend, Sell Rallies in Macro Downtrend)
         is_macro_bull = ema9_5m > ema21_5m and current_close >= ema50_15m and current_close > vwap_5m and slope_5m > 0
         is_macro_bear = ema9_5m < ema21_5m and current_close <= ema50_15m and current_close < vwap_5m and slope_5m < 0
 
         last_bar = tf_1m.bars[-1]
-        if is_macro_bull and last_bar.low <= ema21 and 38 <= rsi_1m <= 60 and ofi >= 0:
+        if is_macro_bull and last_bar.low <= ema21 and 38 <= rsi_1m <= 60 and ofi >= 0 and is_bull_skew and adx_ok:
             metrics["pullback_side"] = 1.0  # Buy
             return MarketRegime.TREND_PULLBACK, metrics
 
-        if is_macro_bear and last_bar.high >= ema21 and 40 <= rsi_1m <= 62 and ofi <= 0:
+        if is_macro_bear and last_bar.high >= ema21 and 40 <= rsi_1m <= 62 and ofi <= 0 and is_bear_skew and adx_ok:
             metrics["pullback_side"] = -1.0  # Sell
             return MarketRegime.TREND_PULLBACK, metrics
 
@@ -516,7 +549,7 @@ class StrategyEngine:
         is_above_vwap = current_close > vwap
         is_bull_di = (plus_di >= minus_di) if adx > 0 else True
 
-        if is_bull_ribbon_1m and is_bull_ribbon_5m and is_macro_bull and is_above_vwap and is_bull_di and ofi >= 0:
+        if is_bull_ribbon_1m and is_bull_ribbon_5m and is_macro_bull and is_above_vwap and is_bull_di and adx_ok and ofi >= 0 and is_bull_skew:
             return MarketRegime.BULL_TREND, metrics
 
         is_bear_ribbon_1m = ema9 < ema21 < ema50
@@ -524,7 +557,7 @@ class StrategyEngine:
         is_below_vwap = current_close < vwap
         is_bear_di = (minus_di >= plus_di) if adx > 0 else True
 
-        if is_bear_ribbon_1m and is_bear_ribbon_5m and is_macro_bear and is_below_vwap and is_bear_di and ofi <= 0:
+        if is_bear_ribbon_1m and is_bear_ribbon_5m and is_macro_bear and is_below_vwap and is_bear_di and adx_ok and ofi <= 0 and is_bear_skew:
             return MarketRegime.BEAR_TREND, metrics
 
         # 4. Mean-Reversion Scalp in Range / Low ADX Chop (ADX < 24)
@@ -607,12 +640,56 @@ class StrategyEngine:
             tp1_dist = price * (tp1_bps / 10000.0)
             return tp_dist, sl_dist, tp1_dist
 
+        # Helper to compute maker price with inside-spread improvement (queue priority)
+        def get_maker_price(target_side: str, default_price: float) -> float:
+            if not self.exec_cfg.maker_first:
+                return default_price
+            sym_u = symbol.upper()
+            if "BTC" in sym_u:
+                tick = 0.1
+            elif "ETH" in sym_u or "SOL" in sym_u:
+                tick = 0.01
+            elif "AVAX" in sym_u or "LINK" in sym_u:
+                tick = 0.001
+            elif any(k in sym_u for k in ("SUI", "XRP", "ADA")):
+                tick = 0.0001
+            elif "DOGE" in sym_u:
+                tick = 0.00001
+            else:
+                tick = 0.0001
+
+            # If spread > 2 * tick, place 1 tick inside spread to capture front of maker queue
+            if orderbook.spread > (2.0 * tick):
+                if target_side == "Buy":
+                    improved = round(best_bid + tick, 6)
+                    if improved < best_ask:
+                        return improved
+                elif target_side == "Sell":
+                    improved = round(best_ask - tick, 6)
+                    if improved > best_bid:
+                        return improved
+            return default_price
+
         # Retrieve dynamic online learner weights if active
         def get_conviction(base: float, regime_key: str) -> float:
             if not self.learner:
                 return base
             w = self.learner.get_weight(regime_key)
             return min(0.98, max(0.50, round(base * w, 2)))
+
+        # Cross-Asset BTC Lead-Lag Filter: suppress altcoin Longs if BTC is Bearish, Shorts if Bullish
+        if symbol != "BTCUSDT" and getattr(self.exec_cfg, "lead_lag_filter", True):
+            btc_trend = self.get_btc_macro_trend()
+            if btc_trend == -1 and (regime in (MarketRegime.BULL_TREND, MarketRegime.TREND_PULLBACK)):
+                pullback_s = metrics.get("pullback_side", 1.0)
+                if regime == MarketRegime.BULL_TREND or pullback_s > 0:
+                    logger.debug(f"[{symbol}] Suppressed LONG entry: BTC macro lead trend is Bearish.")
+                    return None
+            elif btc_trend == 1 and (regime in (MarketRegime.BEAR_TREND, MarketRegime.TREND_PULLBACK)):
+                pullback_s = metrics.get("pullback_side", 1.0)
+                if regime == MarketRegime.BEAR_TREND or pullback_s < 0:
+                    logger.debug(f"[{symbol}] Suppressed SHORT entry: BTC macro lead trend is Bullish.")
+                    return None
 
         # 1. High-Conviction Trend Pullback (Dip Buying / Rally Selling)
         if regime == MarketRegime.TREND_PULLBACK:
@@ -621,7 +698,7 @@ class StrategyEngine:
                 side = "Buy"
                 if is_funding_adverse(side):
                     return None
-                price = best_bid
+                price = get_maker_price("Buy", best_bid)
                 tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
                 tp_price = round(price + tp_dist, 4)
                 sl_price = round(price - sl_dist, 4)
@@ -648,7 +725,7 @@ class StrategyEngine:
                 side = "Sell"
                 if is_funding_adverse(side):
                     return None
-                price = best_ask
+                price = get_maker_price("Sell", best_ask)
                 tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
                 tp_price = round(price - tp_dist, 4)
                 sl_price = round(price + sl_dist, 4)
@@ -788,7 +865,7 @@ class StrategyEngine:
             side = "Buy"
             if is_funding_adverse(side):
                 return None
-            price = best_bid
+            price = get_maker_price("Buy", best_bid)
             tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
             tp_price = round(price + tp_dist, 4)
             sl_price = round(price - sl_dist, 4)
@@ -816,7 +893,7 @@ class StrategyEngine:
             side = "Sell"
             if is_funding_adverse(side):
                 return None
-            price = best_ask
+            price = get_maker_price("Sell", best_ask)
             tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
             tp_price = round(price - tp_dist, 4)
             sl_price = round(price + sl_dist, 4)
