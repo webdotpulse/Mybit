@@ -207,6 +207,7 @@ def test_risk_manager_circuit_breakers():
     assert "consecutive loss" in reason.lower()
 
     # 3. Volatility Spike Check with Auto-Cooldown
+    rm2.cooldown_until = 0.0  # Clear consecutive loss cooldown to isolate volatility circuit breaker
     # Feed 60 regular ATR values (e.g. 10.0), then a spike to 60.0
     for _ in range(60):
         rm2.evaluate_volatility_spike("BTCUSDT", 10.0)
@@ -1274,5 +1275,46 @@ def test_inside_spread_maker_pricing():
     if sig and sig.side == "Buy":
         # Price should be best_bid (162.00) + tick (0.01) = 162.01, NOT sitting behind at 162.00!
         assert sig.price == 162.01
+
+
+def test_volatility_spike_resilience_and_no_cooldown_reset():
+    """Verifies that:
+    1. Unconfirmed tick updates (is_closed_bar=False) do not distort rolling history.
+    2. seed_atr_history accurately seeds baseline from historical bars.
+    3. Microscopic std on flat series does not false-trigger 3-Sigma breaker.
+    4. Repeated spike calls do not perpetually reset the cooldown timer.
+    """
+    cfg = AppConfig()
+    creds = BybitCredentials(api_key="x"*12, api_secret="y"*16, testnet=True)
+    client = BybitV5Client(creds)
+    rm = RiskManager(cfg, client)
+
+    # 1. Test seed_atr_history
+    atr_seeds = [0.0009] * 80
+    rm.seed_atr_history("STRKUSDT", atr_seeds)
+    assert len(rm.rolling_atr_history["STRKUSDT"]) == 80
+
+    # 2. Test unconfirmed ticks do not append
+    initial_len = len(rm.rolling_atr_history["STRKUSDT"])
+    rm.evaluate_volatility_spike("STRKUSDT", 0.00091, is_closed_bar=False)
+    assert len(rm.rolling_atr_history["STRKUSDT"]) == initial_len
+
+    # 3. Test micro fluctuation does NOT trip even if z-score is high (relative floor requirement)
+    is_spike = rm.evaluate_volatility_spike("STRKUSDT", 0.0010, is_closed_bar=True)
+    assert is_spike is False
+    assert rm.volatility_kill_tripped is False
+
+    # 4. Genuine 2x spike trips breaker
+    is_spike = rm.evaluate_volatility_spike("STRKUSDT", 0.0025, is_closed_bar=True)
+    assert is_spike is True
+    assert rm.volatility_kill_tripped is True
+    initial_cooldown = rm.volatility_cooldown_until
+    assert initial_cooldown > time.time()
+
+    # 5. Subsequent calls while tripped DO NOT reset the cooldown timer
+    time.sleep(0.01)
+    is_spike_again = rm.evaluate_volatility_spike("STRKUSDT", 0.0025, is_closed_bar=True)
+    assert is_spike_again is False
+    assert rm.volatility_cooldown_until == initial_cooldown
 
 

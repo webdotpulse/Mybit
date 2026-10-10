@@ -118,6 +118,11 @@ class TradingEngine:
                     klines = await self.client.get_klines(symbol=symbol, interval=tf, limit=100)
                     for k in klines:
                         self.strategy.update_kline(symbol, tf, k)
+                    clean_tf = tf.replace("m", "")
+                    if clean_tf == "1":
+                        tf_1m = self.strategy.series.get(symbol, {}).get("1m") or self.strategy.series.get(symbol, {}).get("1")
+                        if tf_1m:
+                            self.risk_manager.seed_atr_history(symbol, tf_1m.calculate_atr_series())
                 self.client.subscribe_orderbook(symbol)
                 for tf in self.config.strategy.timeframes:
                     self.client.subscribe_kline(symbol, tf)
@@ -204,6 +209,11 @@ class TradingEngine:
                 klines = await self.client.get_klines(symbol=symbol, interval=tf, limit=100)
                 for k in klines:
                     self.strategy.update_kline(symbol, tf, k)
+                clean_tf = tf.replace("m", "")
+                if clean_tf == "1":
+                    tf_1m = self.strategy.series.get(symbol, {}).get("1m") or self.strategy.series.get(symbol, {}).get("1")
+                    if tf_1m:
+                        self.risk_manager.seed_atr_history(symbol, tf_1m.calculate_atr_series())
             self.client.subscribe_orderbook(symbol)
             for tf in self.config.strategy.timeframes:
                 self.client.subscribe_kline(symbol, tf)
@@ -309,7 +319,8 @@ class TradingEngine:
             if tf_1m:
                 atr = tf_1m.calculate_atr()
                 if atr > 0:
-                    is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr)
+                    is_closed = bool(kline.get("confirm", False))
+                    is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr, is_closed_bar=is_closed)
                     if is_spike:
                         cooldown_mins = getattr(self.risk_manager.risk_cfg, "volatility_kill_cooldown_mins", 30)
                         await self.telegram.send_circuit_breaker_alert(
@@ -853,6 +864,11 @@ class TradingEngine:
                             klines = await self.client.get_klines(symbol=sym, interval=tf, limit=100)
                             for k in klines:
                                 self.strategy.update_kline(sym, tf, k)
+                            clean_tf = tf.replace("m", "")
+                            if clean_tf == "1":
+                                tf_1m = self.strategy.series.get(sym, {}).get("1m") or self.strategy.series.get(sym, {}).get("1")
+                                if tf_1m:
+                                    self.risk_manager.seed_atr_history(sym, tf_1m.calculate_atr_series())
                         except Exception as e:
                             logger.debug(f"Failed to prime klines for {sym} {tf}: {e}")
 

@@ -111,8 +111,13 @@ class TimeframeSeries:
 
     def calculate_atr(self, period: int = 14) -> float:
         """Calculates Average True Range."""
+        series = self.calculate_atr_series(period=period)
+        return series[-1] if series else 0.0
+
+    def calculate_atr_series(self, period: int = 14) -> List[float]:
+        """Calculates rolling ATR values for historical bars."""
         if len(self.bars) < period + 1:
-            return 0.0
+            return []
 
         highs = self.get_highs()
         lows = self.get_lows()
@@ -127,13 +132,16 @@ class TimeframeSeries:
             tr_list.append(tr)
 
         if len(tr_list) < period:
-            return 0.0
-        # Exponential smoothing of TR
+            return []
+
+        atrs: List[float] = []
         atr = float(np.mean(tr_list[:period]))
+        atrs.append(atr)
         multiplier = 1.0 / period
         for tr in tr_list[period:]:
             atr = (tr - atr) * multiplier + atr
-        return atr
+            atrs.append(atr)
+        return atrs
 
     def calculate_vwap(self, window_bars: int = 60) -> float:
         """Calculates rolling Volume Weighted Average Price."""

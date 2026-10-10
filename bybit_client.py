@@ -751,7 +751,8 @@ class BybitV5Client:
                 logger.info(f"Connecting to Private WS: {self.ws_private_url}")
                 async with websockets.connect(
                     self.ws_private_url,
-                    ping_interval=None,
+                    ping_interval=20,
+                    ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
                     self._private_ws = ws
@@ -787,7 +788,11 @@ class BybitV5Client:
             except (ConnectionClosed, asyncio.CancelledError, Exception) as e:
                 if not self._running:
                     break
-                logger.warning(f"Private WS disconnected ({e}). Reconnecting in {backoff:.1f}s...")
+                is_idle_refresh = isinstance(e, ConnectionClosed) and "1006" in str(e)
+                if is_idle_refresh and backoff <= 1.0:
+                    logger.info(f"Private WS idle lifecycle refresh ({e}). Reconnecting in {backoff:.1f}s...")
+                else:
+                    logger.warning(f"Private WS disconnected ({e}). Reconnecting in {backoff:.1f}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 

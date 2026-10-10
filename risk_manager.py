@@ -170,15 +170,38 @@ class RiskManager:
                 logger.info(f"Profitable trade (+${pnl:.2f}) reset consecutive loss counter.")
             self.consecutive_losses = 0
 
-    def evaluate_volatility_spike(self, symbol: str, current_atr: float) -> bool:
+    def seed_atr_history(self, symbol: str, atr_values: List[float]) -> None:
+        """Seeds the rolling ATR history from historical bars."""
+        if not atr_values:
+            return
+        history = self.rolling_atr_history.setdefault(symbol, [])
+        for val in atr_values:
+            if val > 0:
+                history.append(float(val))
+        if len(history) > 1440:
+            self.rolling_atr_history[symbol] = history[-1440:]
+
+    def evaluate_volatility_spike(self, symbol: str, current_atr: float, is_closed_bar: bool = True) -> bool:
         """
-        Evaluates whether ATR exceeds 3 standard deviations above its 24h mean.
+        Evaluates whether ATR exceeds 3 standard deviations above its rolling mean.
         Triggers emergency halt if volatility explodes beyond risk boundaries.
+        Only appends to history when is_closed_bar is True to prevent tick spam distortion.
         """
         history = self.rolling_atr_history.setdefault(symbol, [])
-        history.append(current_atr)
-        if len(history) > 1440:  # ~24h of 1m readings
-            history.pop(0)
+        if is_closed_bar:
+            history.append(current_atr)
+            if len(history) > 1440:  # ~24h of 1m readings
+                history.pop(0)
+
+        # If already tripped and still within cooldown, do not re-trip or reset the cooldown timer
+        if self.volatility_kill_tripped:
+            if time.time() < self.volatility_cooldown_until:
+                return False
+            else:
+                self.volatility_kill_tripped = False
+                self.volatility_spike_symbol = None
+                self.volatility_cooldown_until = 0.0
+                logger.info("✅ [CIRCUIT BREAKER] Volatility spike cooldown elapsed. Resuming normal trading.")
 
         if len(history) < 60:
             return False
@@ -186,14 +209,20 @@ class RiskManager:
         mean_atr = float(np.mean(history))
         std_atr = float(np.std(history))
 
-        if std_atr > 0 and (current_atr - mean_atr) / std_atr > self.risk_cfg.atr_spike_threshold_std:
+        # Require significant statistical divergence AND meaningful relative expansion (>= 50% above mean)
+        # to prevent microscopic dispersion (std ~ 0) on low-priced coins from triggering false alarms.
+        is_std_spike = std_atr > 0 and (current_atr - mean_atr) / std_atr > self.risk_cfg.atr_spike_threshold_std
+        is_relative_spike = (current_atr - mean_atr) >= (0.5 * mean_atr)
+
+        if is_std_spike and is_relative_spike:
             self.volatility_kill_tripped = True
             self.volatility_spike_symbol = symbol
             cooldown_mins = getattr(self.risk_cfg, "volatility_kill_cooldown_mins", 30)
             self.volatility_cooldown_until = time.time() + (cooldown_mins * 60)
+            threshold = mean_atr + self.risk_cfg.atr_spike_threshold_std * std_atr
             logger.critical(
                 f"⚡ [CIRCUIT BREAKER] Extreme volatility anomaly on {symbol}: "
-                f"ATR {current_atr:.4f} > 3-Sigma threshold ({mean_atr + 3 * std_atr:.4f}). "
+                f"ATR {current_atr:.4f} > 3-Sigma threshold ({threshold:.4f}, mean={mean_atr:.4f}, std={std_atr:.6f}). "
                 f"Kill switch activated. Pausing new trades for {cooldown_mins} minutes."
             )
             return True
