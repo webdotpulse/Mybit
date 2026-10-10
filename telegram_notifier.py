@@ -24,6 +24,7 @@ class TelegramNotifier:
         config: TelegramConfig,
         panic_callback: Optional[Callable[[], Coroutine[Any, Any, Dict[str, Any]]]] = None,
         status_callback: Optional[Callable[[], Coroutine[Any, Any, str]]] = None,
+        report_callback: Optional[Callable[[], Coroutine[Any, Any, str]]] = None,
     ):
         self.config = config
         self.token = config.bot_token
@@ -31,6 +32,7 @@ class TelegramNotifier:
         self.enabled = bool(config.enabled and self.token and self.chat_id)
         self.panic_callback = panic_callback
         self.status_callback = status_callback
+        self.report_callback = report_callback
         self.session: Optional[aiohttp.ClientSession] = None
         self._running = False
         self._last_update_id = 0
@@ -180,10 +182,20 @@ class TelegramNotifier:
                 await self.send_message(status_text)
             else:
                 await self.send_message("ℹ️ Engine running. Status callback not linked.")
+        elif cmd_lower in ("/report", "/daily", "/summary"):
+            if self.report_callback:
+                report_text = await self.report_callback()
+                await self.send_message(report_text)
+            elif self.status_callback:
+                status_text = await self.status_callback()
+                await self.send_message(status_text)
+            else:
+                await self.send_message("ℹ️ Engine running. Report callback not linked.")
         elif cmd_lower in ("/help", "/start"):
             help_msg = (
                 "🤖 *Bybit Autonomous Engine Remote Control*\n\n"
-                "• `/status` - Check live account balance, PnL, and open positions\n"
+                "• `/status` - Live account balance, equity, and open positions\n"
+                "• `/report` - 24-hour daily performance digest (PnL, win rate, trades)\n"
                 "• `/panic` - Instantly cancel all orders and market close positions\n"
                 "• `/help` - Show this menu"
             )

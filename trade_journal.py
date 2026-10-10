@@ -218,6 +218,45 @@ class TradeJournal:
                 "avg_trade_pnl": round(float(np.mean(pnls)), 2),
             }
 
+    def get_window_metrics(self, hours: int = 24) -> Dict[str, Any]:
+        """Calculates performance statistics for a recent time window (e.g. past 24 hours)."""
+        cutoff = int(time.time()) - (hours * 3600)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT realized_pnl, realized_pnl_pct, fee_paid FROM trades WHERE exit_time >= ?",
+                (cutoff,)
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return {
+                    "total_trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate": 0.0,
+                    "total_pnl": 0.0,
+                    "fees_paid": 0.0,
+                    "profit_factor": 0.0,
+                }
+            pnls = [r[0] for r in rows]
+            fees = sum(r[2] for r in rows)
+            wins = [p for p in pnls if p > 0]
+            losses = [abs(p) for p in pnls if p < 0]
+            total_trades = len(pnls)
+            win_rate = (len(wins) / total_trades) * 100.0 if total_trades > 0 else 0.0
+            sum_gains = sum(wins)
+            sum_losses = sum(losses)
+            profit_factor = (sum_gains / sum_losses) if sum_losses > 0 else (99.0 if sum_gains > 0 else 0.0)
+            return {
+                "total_trades": total_trades,
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": round(win_rate, 2),
+                "total_pnl": round(sum(pnls), 2),
+                "fees_paid": round(fees, 2),
+                "profit_factor": round(profit_factor, 2),
+            }
+
 
 class ParameterAutoTuner:
     """

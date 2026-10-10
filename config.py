@@ -369,6 +369,8 @@ class TelegramConfig(BaseModel):
     bot_token: Optional[str] = Field(default=None)
     chat_id: Optional[str] = Field(default=None)
     poll_commands: bool = Field(default=True)
+    daily_summary_enabled: bool = Field(default=True)
+    daily_summary_hour_utc: int = Field(default=0, ge=0, le=23)
 
 
 class AppConfig(BaseModel):

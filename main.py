@@ -58,6 +58,7 @@ class TradingEngine:
             config.telegram,
             panic_callback=self.panic_stop,
             status_callback=self.get_status_text,
+            report_callback=self.get_daily_summary_text,
         )
 
         self._running = False
@@ -249,6 +250,8 @@ class TradingEngine:
         self._background_tasks.append(asyncio.create_task(self._status_publisher_loop()))
         if self.config.strategy.auto_scan_symbols:
             self._background_tasks.append(asyncio.create_task(self._volatility_scanner_loop()))
+        if getattr(self.config.telegram, "daily_summary_enabled", True):
+            self._background_tasks.append(asyncio.create_task(self._daily_report_loop()))
 
         logger.info("Trading engine execution loops active. Awaiting regime opportunities...")
         while self._running:
@@ -1003,6 +1006,62 @@ class TradingEngine:
             f"• *Active Positions* ({len(s['positions'])}):\n{pos_str}\n"
             f"• *Pending Orders*: {s['pending_orders']}"
         )
+
+    async def get_daily_summary_text(self) -> str:
+        """Formats comprehensive 24-hour executive performance report for Telegram."""
+        s = self.get_status_dict()
+        m_24h = self.journal.get_window_metrics(hours=24)
+        m_all = s["metrics"]
+
+        pos_lines = []
+        for p in s["positions"]:
+            sign = "+" if p["unrealised_pnl"] >= 0 else ""
+            pos_lines.append(
+                f"• {p['symbol']} ({p['side']}): {p['size']} @ ${p['entry_price']:.4f} | uPnL: `{sign}${p['unrealised_pnl']:.2f}`"
+            )
+        pos_str = "\n".join(pos_lines) if pos_lines else "None (100% Cash Buffer)"
+
+        pnl_sign = "+" if m_24h["total_pnl"] >= 0 else ""
+        date_str = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+        return (
+            f"📅 *Daily Performance Digest — {date_str}*\n"
+            f"────────────────────────\n"
+            f"💰 *Account Equity*: `${s['equity']:,.2f}`\n"
+            f"📈 *24h Realized PnL*: `{pnl_sign}${m_24h['total_pnl']:,.2f}`\n"
+            f"🎯 *24h Trades*: `{m_24h['total_trades']}` (`{m_24h['wins']}` Wins / `{m_24h['losses']}` Losses)\n"
+            f"⚡ *24h Win Rate*: `{m_24h['win_rate']}%` (PF: `{m_24h['profit_factor']}`)\n"
+            f"🛡️ *Active Positions* ({len(s['positions'])}):\n{pos_str}\n"
+            f"🏦 *Capital Tier*: `{s['capital_tier']}` (Drawdown: `{s['daily_drawdown_pct']}%`)\n"
+            f"📊 *All-Time PnL*: `${m_all['total_pnl']:,.2f}` across `{m_all['total_trades']}` trades"
+        )
+
+    async def _daily_report_loop(self) -> None:
+        """Dispatches automated daily performance report via Telegram once per day."""
+        last_sent_day = ""
+        while self._running:
+            try:
+                now_utc = time.gmtime()
+                today_str = time.strftime("%Y-%m-%d", now_utc)
+                target_hour = getattr(self.config.telegram, "daily_summary_hour_utc", 0)
+
+                if (
+                    self.telegram.enabled
+                    and getattr(self.config.telegram, "daily_summary_enabled", True)
+                    and now_utc.tm_hour == target_hour
+                    and today_str != last_sent_day
+                ):
+                    report = await self.get_daily_summary_text()
+                    await self.telegram.send_message(report)
+                    last_sent_day = today_str
+                    logger.info("Sent automated daily performance report via Telegram.")
+
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Error in daily report loop: {e}")
+                await asyncio.sleep(60)
 
     async def panic_stop(self) -> Dict[str, Any]:
         """Triggers emergency liquidation and order cancellation."""
