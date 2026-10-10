@@ -311,9 +311,10 @@ class TradingEngine:
                 if atr > 0:
                     is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr)
                     if is_spike:
+                        cooldown_mins = getattr(self.risk_manager.risk_cfg, "volatility_kill_cooldown_mins", 30)
                         await self.telegram.send_circuit_breaker_alert(
                             "Volatility Spike Kill Switch",
-                            f"Extreme ATR spike detected on {symbol} (ATR={atr:.4f}). Halting new orders.",
+                            f"Extreme ATR spike detected on {symbol} (ATR={atr:.4f}). Halting new orders for {cooldown_mins}m.",
                         )
 
     async def _on_execution_update(self, exec_data: Dict[str, Any]) -> None:
@@ -952,6 +953,9 @@ class TradingEngine:
                     0, int(self.risk_manager.cooldown_until - time.time())
                 ),
                 "volatility_kill": self.risk_manager.volatility_kill_tripped,
+                "volatility_cooldown_remaining_sec": max(
+                    0, int(self.risk_manager.volatility_cooldown_until - time.time())
+                ) if self.risk_manager.volatility_kill_tripped else 0,
             },
             "metrics": summary,
             "positions": pos_list,

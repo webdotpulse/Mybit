@@ -206,13 +206,25 @@ def test_risk_manager_circuit_breakers():
     assert allowed is False
     assert "consecutive loss" in reason.lower()
 
-    # 3. Volatility Spike Check
+    # 3. Volatility Spike Check with Auto-Cooldown
     # Feed 60 regular ATR values (e.g. 10.0), then a spike to 60.0
     for _ in range(60):
         rm2.evaluate_volatility_spike("BTCUSDT", 10.0)
     is_spike = rm2.evaluate_volatility_spike("BTCUSDT", 60.0)
     assert is_spike is True
     assert rm2.volatility_kill_tripped is True
+    assert rm2.volatility_cooldown_until > time.time()
+
+    # Blocked during cooldown
+    allowed, reason = rm2.is_order_permitted("BTCUSDT", 50.0)
+    assert allowed is False
+    assert "volatility" in reason.lower()
+
+    # Auto-resumes once cooldown timer elapses
+    rm2.volatility_cooldown_until = time.time() - 1.0
+    allowed, reason = rm2.is_order_permitted("BTCUSDT", 50.0)
+    assert allowed is True
+    assert rm2.volatility_kill_tripped is False
 
 
 def test_trade_journal_and_autotuner():

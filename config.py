@@ -159,6 +159,12 @@ class RiskConfig(BaseModel):
         le=6.0,
         description="ATR volatility spike kill switch threshold in standard deviations"
     )
+    volatility_kill_cooldown_mins: int = Field(
+        default=30,
+        ge=1,
+        le=240,
+        description="Cooldown duration to automatically resume trading after a volatility spike kill switch (minutes)"
+    )
     default_leverage: int = Field(
         default=5,
         ge=1,

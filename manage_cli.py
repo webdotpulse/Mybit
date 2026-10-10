@@ -125,10 +125,19 @@ def render_status() -> None:
 
     # 3. Volatility Spike
     vol_kill = cb.get("volatility_kill", False)
+    vol_rem = cb.get("volatility_cooldown_remaining_sec", 0)
+    cooldown_mins = getattr(config.risk, "volatility_kill_cooldown_mins", 30)
+    if vol_kill and vol_rem > 0:
+        vol_status = f"[bold red]HALTED ({vol_rem}s remaining)[/bold red]"
+    elif vol_kill:
+        vol_status = "[bold red]HALTED[/bold red]"
+    else:
+        vol_status = "[bold green]NORMAL[/bold green]"
+
     cb_table.add_row(
         "3-Sigma Volatility Spike",
-        "[bold red]HALTED[/bold red]" if vol_kill else "[bold green]NORMAL[/bold green]",
-        f"Threshold: > {config.risk.atr_spike_threshold_std} Std Dev",
+        vol_status,
+        f"Threshold: > {config.risk.atr_spike_threshold_std} Std Dev | Cooldown: {cooldown_mins} mins",
     )
 
     console.print(Panel(cb_table, title="Circuit Breakers & Protection Failsafes", border_style="yellow"))

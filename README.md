@@ -56,7 +56,7 @@ The engine processes multi-timeframe market data and orderbook microstructure in
 * **Account Circuit Breakers**:
   * **Max Daily Drawdown (2.5%)**: Immediate trading halt for the remainder of the UTC day if equity drops $2.5\%$ below the high-water mark.
   * **Consecutive Loss Cutoff**: Pauses all new trades for a **30-minute cooldown** if 4 consecutive loss fills occur.
-  * **3-Sigma Volatility Spike**: Kill switch activated when current ATR exceeds 3 standard deviations above the 24-hour mean.
+  * **3-Sigma Volatility Spike**: Kill switch activated when current ATR exceeds 3 standard deviations above the 24-hour mean, pausing new trades for a **30-minute self-clearing cooldown**.
 * **10-Second Active State Reconciliation**: Periodic async loop querying Bybit private endpoints (`/v5/position/list` and `/v5/order/realtime`) to detect external fills, eliminate orphaned orders, and synchronize margin state.
 * **Emergency Panic Stop**: Instantly cancels all active orders and submits Market Reduce-Only orders to flatten all open positions.
 

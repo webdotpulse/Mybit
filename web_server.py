@@ -104,6 +104,7 @@ async def handle_api_status(request: web.Request) -> web.Response:
             "in_cooldown": False,
             "cooldown_remaining_sec": 0,
             "volatility_kill": False,
+            "volatility_cooldown_remaining_sec": 0,
         },
         "metrics": {
             "total_trades": 0,

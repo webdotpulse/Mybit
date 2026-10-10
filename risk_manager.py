@@ -103,6 +103,8 @@ class RiskManager:
         self.cooldown_until: float = 0.0
         self.daily_drawdown_tripped: bool = False
         self.volatility_kill_tripped: bool = False
+        self.volatility_cooldown_until: float = 0.0
+        self.volatility_spike_symbol: Optional[str] = None
         self.panic_triggered: bool = False
 
         # In-Memory Active Position State (symbol -> Position)
@@ -142,6 +144,8 @@ class RiskManager:
         """Resets all circuit breaker trips and resumes normal trading."""
         self.daily_drawdown_tripped = False
         self.volatility_kill_tripped = False
+        self.volatility_cooldown_until = 0.0
+        self.volatility_spike_symbol = None
         self.consecutive_losses = 0
         self.cooldown_until = 0.0
         self.panic_triggered = False
@@ -184,9 +188,13 @@ class RiskManager:
 
         if std_atr > 0 and (current_atr - mean_atr) / std_atr > self.risk_cfg.atr_spike_threshold_std:
             self.volatility_kill_tripped = True
+            self.volatility_spike_symbol = symbol
+            cooldown_mins = getattr(self.risk_cfg, "volatility_kill_cooldown_mins", 30)
+            self.volatility_cooldown_until = time.time() + (cooldown_mins * 60)
             logger.critical(
                 f"⚡ [CIRCUIT BREAKER] Extreme volatility anomaly on {symbol}: "
-                f"ATR {current_atr:.4f} > 3-Sigma threshold ({mean_atr + 3 * std_atr:.4f}). Kill switch activated."
+                f"ATR {current_atr:.4f} > 3-Sigma threshold ({mean_atr + 3 * std_atr:.4f}). "
+                f"Kill switch activated. Pausing new trades for {cooldown_mins} minutes."
             )
             return True
         return False
@@ -204,7 +212,14 @@ class RiskManager:
             return False, f"In consecutive loss cooldown ({remaining}s remaining)."
 
         if self.volatility_kill_tripped:
-            return False, "Volatility anomaly kill switch active."
+            if time.time() < self.volatility_cooldown_until:
+                remaining = int(self.volatility_cooldown_until - time.time())
+                return False, f"In volatility anomaly cooldown ({remaining}s remaining)."
+            else:
+                self.volatility_kill_tripped = False
+                self.volatility_spike_symbol = None
+                self.volatility_cooldown_until = 0.0
+                logger.info("✅ [CIRCUIT BREAKER] Volatility spike cooldown elapsed. Resuming normal trading.")
 
         # Maximum concurrent open positions limit
         if symbol not in self.positions and len(self.positions) >= self.risk_cfg.max_open_positions:
@@ -281,6 +296,14 @@ class RiskManager:
 
             self.reconciliation_count += 1
             self.last_reconciliation_ts = time.time()
+
+            # Auto-clear volatility spike kill switch if cooldown period has elapsed
+            if self.volatility_kill_tripped and time.time() >= self.volatility_cooldown_until:
+                self.volatility_kill_tripped = False
+                self.volatility_spike_symbol = None
+                self.volatility_cooldown_until = 0.0
+                logger.info("✅ [CIRCUIT BREAKER] Volatility spike cooldown elapsed. Resuming normal trading.")
+
             logger.debug(f"State reconciled successfully. Active positions: {len(self.positions)}")
         except Exception as e:
             logger.error(f"Error during state reconciliation: {e}")

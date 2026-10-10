@@ -222,6 +222,21 @@ function renderDashboard() {
   }
   document.getElementById('cb-loss-count').innerText = `${cb.consecutive_losses || 0} / 4 Losses (30m cooldown)`;
 
+  const volBadge = document.getElementById('cb-vol-badge');
+  if (volBadge) {
+    if (cb.volatility_kill) {
+      if (cb.volatility_cooldown_remaining_sec > 0) {
+        volBadge.innerText = `COOLDOWN (${cb.volatility_cooldown_remaining_sec}s)`;
+      } else {
+        volBadge.innerText = 'HALTED';
+      }
+      volBadge.className = 'cb-badge cb-tripped';
+    } else {
+      volBadge.innerText = 'ACTIVE / OK';
+      volBadge.className = 'cb-badge cb-active';
+    }
+  }
+
   // Tuning Params
   if (engineData.parameters) {
     document.getElementById('param-tp').innerText = `${engineData.parameters.tp_atr_mult.toFixed(2)} × ATR`;
