@@ -181,7 +181,7 @@ class RiskManager:
         if len(history) > 1440:
             self.rolling_atr_history[symbol] = history[-1440:]
 
-    def evaluate_volatility_spike(self, symbol: str, current_atr: float, is_closed_bar: bool = True) -> bool:
+    def evaluate_volatility_spike(self, symbol: str, current_atr: float, is_closed_bar: bool = True, price: Optional[float] = None) -> bool:
         """
         Evaluates whether ATR exceeds 3 standard deviations above its rolling mean.
         Triggers emergency halt if volatility explodes beyond risk boundaries.
@@ -206,8 +206,17 @@ class RiskManager:
         if len(history) < 60:
             return False
 
+        # If price is provided, ensure ATR represents meaningful price movement (>= 0.4%)
+        if price is not None and price > 0:
+            if (current_atr / price) < 0.004:
+                return False
+
         mean_atr = float(np.mean(history))
         std_atr = float(np.std(history))
+
+        # Ignore microscopic absolute ATR floor (< 0.0003) to prevent stablecoins and sub-tick noise from tripping
+        if current_atr < 0.0003 and mean_atr < 0.0003:
+            return False
 
         # Require significant statistical divergence AND meaningful relative expansion (>= 50% above mean)
         # to prevent microscopic dispersion (std ~ 0) on low-priced coins from triggering false alarms.
@@ -283,22 +292,35 @@ class RiskManager:
                 if size > 0:
                     current_symbols.add(symbol)
                     existing = self.positions.get(symbol)
+                    entry_price = _to_float(p.get("avgPrice"))
+                    side = p.get("side", "")
+                    exec_cfg = self.config.execution
+
+                    # Recover or compute Tier 1 TP price if missing
+                    tp1_price = existing.tp1_price if existing else None
+                    if tp1_price is None and entry_price > 0 and exec_cfg.tiered_tp_enabled:
+                        tp1_bps = getattr(exec_cfg, "tp1_bps", 75.0)
+                        tp1_dist = entry_price * (tp1_bps / 10000.0)
+                        tp1_price = round(entry_price + tp1_dist, 4) if side == "Buy" else round(entry_price - tp1_dist, 4)
+
+                    entry_atr = existing.entry_atr if (existing and existing.entry_atr > 0) else (entry_price * 0.005)
+
                     self.positions[symbol] = Position(
                         symbol=symbol,
-                        side=p.get("side", ""),
+                        side=side,
                         size=size,
-                        entry_price=_to_float(p.get("avgPrice")),
+                        entry_price=entry_price,
                         mark_price=_to_float(p.get("markPrice")),
                         unrealised_pnl=_to_float(p.get("unrealisedPnl")),
                         leverage=_to_int(p.get("leverage"), 1),
                         take_profit=_to_float(p.get("takeProfit")) or None,
                         stop_loss=_to_float(p.get("stopLoss")) or None,
                         trailing_stop=_to_float(p.get("trailingStop")) or None,
-                        entry_atr=existing.entry_atr if existing else 0.0,
+                        entry_atr=entry_atr,
                         breakeven_set=existing.breakeven_set if existing else False,
                         opened_at=existing.opened_at if existing else time.time(),
                         entry_features=existing.entry_features if existing else {},
-                        tp1_price=existing.tp1_price if existing else None,
+                        tp1_price=tp1_price,
                         tp1_filled=existing.tp1_filled if existing else False,
                         original_size=existing.original_size if (existing and existing.original_size > 0) else size,
                     )

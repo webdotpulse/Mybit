@@ -323,7 +323,8 @@ class TradingEngine:
                 atr = tf_1m.calculate_atr()
                 if atr > 0:
                     is_closed = bool(kline.get("confirm", False))
-                    is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr, is_closed_bar=is_closed)
+                    close_px = float(kline.get("close", 0.0))
+                    is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr, is_closed_bar=is_closed, price=close_px)
                     if is_spike:
                         cooldown_mins = getattr(self.risk_manager.risk_cfg, "volatility_kill_cooldown_mins", 30)
                         await self.telegram.send_circuit_breaker_alert(
@@ -469,19 +470,32 @@ class TradingEngine:
             if size > 0:
                 existing = self.risk_manager.positions.get(symbol)
                 ctx = self._position_context.get(symbol, {})
+                entry_price = _to_float(pos_data.get("entryPrice") or pos_data.get("avgPrice"))
+                side = pos_data.get("side", "")
+                exec_cfg = self.config.execution
+
                 entry_atr = existing.entry_atr if (existing and existing.entry_atr > 0) else float(ctx.get("atr", 0.0))
+                if entry_atr <= 0 and entry_price > 0:
+                    entry_atr = entry_price * 0.005
+
                 opened_at = existing.opened_at if (existing and existing.opened_at > 0) else float(ctx.get("placed_at", time.time()))
                 breakeven_set = existing.breakeven_set if existing else False
                 entry_features = existing.entry_features if existing else ctx
+
                 tp1_price = existing.tp1_price if (existing and existing.tp1_price) else ctx.get("tp1_price")
+                if tp1_price is None and entry_price > 0 and exec_cfg.tiered_tp_enabled:
+                    tp1_bps = getattr(exec_cfg, "tp1_bps", 75.0)
+                    tp1_dist = entry_price * (tp1_bps / 10000.0)
+                    tp1_price = round(entry_price + tp1_dist, 4) if side == "Buy" else round(entry_price - tp1_dist, 4)
+
                 tp1_filled = existing.tp1_filled if existing else False
                 original_size = existing.original_size if (existing and existing.original_size > 0) else (ctx.get("size") or size)
 
                 self.risk_manager.positions[symbol] = Position(
                     symbol=symbol,
-                    side=pos_data.get("side", ""),
+                    side=side,
                     size=size,
-                    entry_price=_to_float(pos_data.get("entryPrice") or pos_data.get("avgPrice")),
+                    entry_price=entry_price,
                     mark_price=_to_float(pos_data.get("markPrice")),
                     unrealised_pnl=_to_float(pos_data.get("unrealisedPnl")),
                     leverage=_to_int(pos_data.get("leverage"), 1),
@@ -802,11 +816,17 @@ class TradingEngine:
 
             candidates = []
             min_turnover = float(self.config.strategy.scanner_min_turnover_usd)
-            excluded = {"USDCUSDT", "FDUSDUSDT", "USDEUSDT", "USDYUSDT", "BUSDUSDT"}
+            excluded = {
+                "USDCUSDT", "FDUSDUSDT", "USDEUSDT", "USDYUSDT", "BUSDUSDT",
+                "USUSDT", "EURUSDT", "TUSDUSDT", "CUSDUSDT", "USD0USDT"
+            }
 
             for t in tickers:
                 sym = t.get("symbol", "")
                 if not sym.endswith("USDT") or sym in excluded:
+                    continue
+                # Exclude any stablecoins or fiat-pegged pairs
+                if any(sym.startswith(prefix) for prefix in ("USDC", "FDUSD", "USDE", "USDY", "BUSD", "US", "TUSD", "EUR", "DAI", "CUSD", "USD")):
                     continue
 
                 turnover = _to_float(t.get("turnover24h"))
@@ -821,6 +841,11 @@ class TradingEngine:
                 low = _to_float(t.get("lowPrice24h"))
                 price_pct = abs(_to_float(t.get("price24hPcnt")))
                 range_pct = ((high - low) / last_price) if last_price > 0 else 0.0
+
+                # Must have at least 1.5% intraday range to filter out flat/dead pairs and remaining stablecoins
+                if range_pct < 0.015:
+                    continue
+
                 volatility_score = max(price_pct, range_pct)
 
                 score = volatility_score * (turnover ** 0.3)

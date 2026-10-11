@@ -1317,4 +1317,55 @@ def test_volatility_spike_resilience_and_no_cooldown_reset():
     assert is_spike_again is False
     assert rm.volatility_cooldown_until == initial_cooldown
 
+    # 6. Microscopic absolute ATR floor (< 0.0003) on stablecoins does NOT trip even if relative spike is 2x
+    rm_micro = RiskManager(cfg, client)
+    rm_micro.seed_atr_history("USUSDT", [0.0001] * 80)
+    is_spike_micro = rm_micro.evaluate_volatility_spike("USUSDT", 0.0002, is_closed_bar=True, price=1.0)
+    assert is_spike_micro is False
+    assert rm_micro.volatility_kill_tripped is False
+
+
+@pytest.mark.asyncio
+async def test_position_reconciliation_recovery_from_restart():
+    """
+    Verifies that when the daemon restarts with clean memory, an existing active Bybit
+    position automatically reconstructs tp1_price and entry_atr so Tier 1 Take-Profit
+    and Breakeven advancement are never orphaned.
+    """
+    config = AppConfig()
+    creds = BybitCredentials(api_key="x" * 12, api_secret="y" * 16, testnet=True)
+    client = BybitV5Client(creds)
+    rm = RiskManager(config, client)
+
+    # Empty local memory (simulating fresh daemon startup)
+    assert len(rm.positions) == 0
+
+    client.get_positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "DOGEUSDT",
+                "side": "Buy",
+                "size": "721.0",
+                "avgPrice": "0.0835",
+                "markPrice": "0.0852",
+                "unrealisedPnl": "1.21",
+                "leverage": "5",
+                "takeProfit": "0.0865",
+                "stopLoss": "0.0820",
+            }
+        ]
+    )
+    client.get_open_orders = AsyncMock(return_value=[])
+
+    await rm.reconcile()
+
+    doge_pos = rm.positions.get("DOGEUSDT")
+    assert doge_pos is not None
+    # Auto-calculated tp1_price (+75 bps above 0.0835 = 0.0841)
+    assert doge_pos.tp1_price is not None
+    assert doge_pos.tp1_price == round(0.0835 * (1 + 75.0 / 10000.0), 4)
+    assert doge_pos.entry_atr > 0
+    assert doge_pos.mark_price == 0.0852
+
+
 
