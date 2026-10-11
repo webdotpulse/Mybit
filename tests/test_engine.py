@@ -160,22 +160,22 @@ def test_strategy_indicators_and_regimes():
 
 
 def test_dynamic_kelly_scaling():
-    """Verifies Half-Kelly formula bounds [0.5%, 1.5%]."""
+    """Verifies Half-Kelly formula bounds [2.5%, 5.0%]."""
     cfg = AppConfig()
     strat = StrategyEngine(cfg)
 
-    # Unseeded -> Default midpoint 1.0%
-    assert strat.calculate_kelly_fraction() == 0.01
+    # Unseeded -> Default midpoint 3.75%
+    assert round(strat.calculate_kelly_fraction(), 4) == 0.0375
 
     # Record 20 winning trades
     for _ in range(20):
         strat.record_trade_result(50.0)
-    assert strat.calculate_kelly_fraction() == 0.015  # Max bounded at 1.5%
+    assert round(strat.calculate_kelly_fraction(), 4) == 0.05  # Max bounded at 5.0%
 
     # Record consecutive losses
     for _ in range(30):
         strat.record_trade_result(-50.0)
-    assert strat.calculate_kelly_fraction() == 0.005  # Min bounded at 0.5%
+    assert round(strat.calculate_kelly_fraction(), 4) == 0.025  # Min bounded at 2.5%
 
 
 def test_risk_manager_circuit_breakers():

@@ -615,7 +615,7 @@ class StrategyEngine:
             return None
 
         tp_atr_mult = self.exec_cfg.bracket_tp_atr_mult
-        breakout_tp = getattr(self.exec_cfg, "breakout_tp_atr_mult", 1.40)
+        breakout_tp = getattr(self.exec_cfg, "breakout_tp_atr_mult", 2.40)
         sl_atr_mult = self.exec_cfg.bracket_sl_atr_mult
 
         # Adverse Funding Rate Filter helper
@@ -640,11 +640,11 @@ class StrategyEngine:
         # Helper to compute fee-aware bracket distances
         def get_bracket_distances(price: float, is_5m_wave: bool = True) -> Tuple[float, float, float]:
             base_atr = atr_5m if (is_5m_wave and atr_5m > 0) else atr
-            # Enforce minimum profit target of 40 bps to solidly clear all exchange fees
-            min_tp_dist = price * 0.0040
+            # Enforce minimum profit target of 50 bps to solidly clear all exchange fees
+            min_tp_dist = price * 0.0050
             tp_dist = max(tp_atr_mult * base_atr, min_tp_dist)
             sl_dist = max(sl_atr_mult * base_atr, price * 0.0025)
-            tp1_bps = getattr(self.exec_cfg, "tp1_bps", 50.0)
+            tp1_bps = getattr(self.exec_cfg, "tp1_bps", 75.0)
             tp1_dist = price * (tp1_bps / 10000.0)
             return tp_dist, sl_dist, tp1_dist
 

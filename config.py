@@ -85,8 +85,8 @@ def get_tier_for_equity(equity: float) -> Tuple[CapitalTier, Dict[str, Any]]:
                 "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
                 "max_open_positions": 3,
                 "max_daily_risk_pct": 2.5,
-                "min_position_equity_pct": 0.5,
-                "max_position_equity_pct": 1.5,
+                "min_position_equity_pct": 2.5,
+                "max_position_equity_pct": 5.0,
                 "default_leverage": 5,
                 "auto_tuning_interval": 20,
                 "description": "Standard Quantitative Tier ($1,000 - $9,999). Major bluechips, max 3 positions, 2.5% daily risk."
@@ -130,13 +130,13 @@ class RiskConfig(BaseModel):
         description="Daily max drawdown circuit breaker threshold (%)"
     )
     min_position_equity_pct: float = Field(
-        default=0.5,
+        default=2.5,
         ge=0.1,
         le=35.0,
         description="Lower bound Kelly position sizing fraction (%)"
     )
     max_position_equity_pct: float = Field(
-        default=1.5,
+        default=5.0,
         ge=0.5,
         le=50.0,
         description="Upper bound Kelly position sizing fraction (%)"
@@ -198,15 +198,15 @@ class ExecutionConfig(BaseModel):
         description="Timeout waiting for maker fill before recalculating or aggressive IOC"
     )
     bracket_tp_atr_mult: float = Field(
-        default=1.40,
+        default=1.80,
         ge=0.4,
         le=5.0,
         description="ATR multiplier for native Take Profit bracket"
     )
     breakout_tp_atr_mult: float = Field(
-        default=2.2,
+        default=2.4,
         ge=1.0,
-        le=5.0,
+        le=6.0,
         description="ATR multiplier for high-conviction breakout Take Profit bracket"
     )
     bracket_sl_atr_mult: float = Field(
@@ -230,19 +230,19 @@ class ExecutionConfig(BaseModel):
         description="Ratio of position size closed at Tier 1 Take Profit"
     )
     tp1_bps: float = Field(
-        default=50.0,
+        default=75.0,
         ge=15.0,
-        le=100.0,
+        le=150.0,
         description="Target basis points for Tier 1 quick profit lock"
     )
     breakeven_atr_trigger: float = Field(
-        default=1.2,
+        default=1.5,
         ge=0.2,
         le=3.0,
         description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
     )
     breakeven_buffer_bps: float = Field(
-        default=12.0,
+        default=16.0,
         ge=0.0,
         le=50.0,
         description="Buffer in basis points above entry price when setting Breakeven Stop Loss (covers round-trip fees + slippage)"
