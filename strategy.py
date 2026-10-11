@@ -599,8 +599,9 @@ class StrategyEngine:
 
         # Check spread sanity: avoid trading if spread is too wide
         spread_bps = (orderbook.spread / mid) * 10000.0
-        if spread_bps > 15.0:
-            logger.debug(f"[{symbol}] Spread too wide ({spread_bps:.1f} bps). Skipping.")
+        max_spread = getattr(self.exec_cfg, "max_spread_bps", 10.0)
+        if spread_bps > max_spread:
+            logger.debug(f"[{symbol}] Spread too wide ({spread_bps:.1f} bps > {max_spread:.1f} bps). Skipping.")
             return None
 
         regime, metrics = self.classify_regime(symbol, orderbook)
@@ -824,6 +825,9 @@ class StrategyEngine:
                 sl_dist = max(sl_atr_mult * base_atr, price * 0.0028)
                 tp_price = round(price + tp_dist, 4)
                 sl_price = round(price - sl_dist, 4)
+                tp1_bps = getattr(self.exec_cfg, "tp1_bps", 75.0)
+                tp1_dist = price * (tp1_bps / 10000.0)
+                tp1_price = round(price + tp1_dist, 4)
                 conviction = get_conviction(0.80, "volatility_expansion")
 
                 return Signal(
@@ -839,6 +843,8 @@ class StrategyEngine:
                     time_in_force="IOC",
                     leverage=self.risk_cfg.default_leverage,
                     metadata=metrics,
+                    tp1_price=tp1_price,
+                    tp2_price=tp_price,
                 )
             elif metrics["close"] < metrics["vwap"] and orderbook.ofi < 0:
                 side = "Sell"
@@ -850,6 +856,9 @@ class StrategyEngine:
                 sl_dist = max(sl_atr_mult * base_atr, price * 0.0028)
                 tp_price = round(price - tp_dist, 4)
                 sl_price = round(price + sl_dist, 4)
+                tp1_bps = getattr(self.exec_cfg, "tp1_bps", 75.0)
+                tp1_dist = price * (tp1_bps / 10000.0)
+                tp1_price = round(price - tp1_dist, 4)
                 conviction = get_conviction(0.80, "volatility_expansion")
 
                 return Signal(
@@ -865,6 +874,8 @@ class StrategyEngine:
                     time_in_force="IOC",
                     leverage=self.risk_cfg.default_leverage,
                     metadata=metrics,
+                    tp1_price=tp1_price,
+                    tp2_price=tp_price,
                 )
             return None
 

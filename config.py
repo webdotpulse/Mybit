@@ -236,7 +236,7 @@ class ExecutionConfig(BaseModel):
         description="Target basis points for Tier 1 quick profit lock"
     )
     breakeven_atr_trigger: float = Field(
-        default=1.5,
+        default=1.3,
         ge=0.2,
         le=3.0,
         description="ATR gain trigger to advance Stop Loss to Breakeven (+ fee buffer)"
@@ -284,7 +284,7 @@ class ExecutionConfig(BaseModel):
         description="Enforce ADX trend strength threshold to suppress low-volatility chop"
     )
     adx_threshold: float = Field(
-        default=20.0,
+        default=23.0,
         ge=10.0,
         le=50.0,
         description="Minimum ADX required for trend scalping signals"
@@ -294,7 +294,7 @@ class ExecutionConfig(BaseModel):
         description="Require candle volume >= multiplier * 20-period volume SMA"
     )
     volume_multiplier: float = Field(
-        default=1.1,
+        default=1.15,
         ge=0.8,
         le=3.0,
         description="Volume multiplier relative to SMA(20) required for breakout entries"
@@ -304,6 +304,12 @@ class ExecutionConfig(BaseModel):
         ge=1.0,
         le=30.0,
         description="Maximum slippage tolerance in basis points for IOC orders"
+    )
+    max_spread_bps: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=50.0,
+        description="Maximum allowable bid-ask spread in basis points before skipping trade"
     )
 
 

@@ -29,7 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 from bybit_client import OrderBookL2
-from config import AppConfig, CapitalTier, ExecutionConfig, RiskConfig, StrategyConfig, get_tier_for_equity
+from config import AppConfig, CapitalTier, ExecutionConfig, RiskConfig, StrategyConfig, get_tier_for_equity, load_config
 from strategy import Bar, MarketRegime, StrategyEngine, TimeframeSeries
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -595,23 +595,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Bybit V5 Strategy Backtester")
     parser.add_argument("--symbol", default="DOGEUSDT", help="Symbol to backtest (default: DOGEUSDT)")
     parser.add_argument("--bars", type=int, default=3000, help="Number of 1m bars to fetch (default: 3000 ~ 2.1 days)")
-    parser.add_argument("--capital", type=float, default=100.0, help="Starting capital pool in USD (default: 100.0)")
-    parser.add_argument("--leverage", type=int, default=5, help="Leverage multiplier (default: 5)")
-    parser.add_argument("--tp-mult", type=float, default=1.4, help="Take profit ATR multiplier (default: 1.4)")
-    parser.add_argument("--sl-mult", type=float, default=0.8, help="Stop loss ATR multiplier (default: 0.8)")
-    parser.add_argument("--be-trigger", type=float, default=1.2, help="Breakeven ATR trigger (default: 1.2)")
-    parser.add_argument("--tp1-bps", type=float, default=50.0, help="Tier 1 take profit in bps (default: 50.0)")
+    parser.add_argument("--capital", type=float, default=None, help="Starting capital pool in USD (default from config.json)")
+    parser.add_argument("--leverage", type=int, default=None, help="Leverage multiplier (default from config.json)")
+    parser.add_argument("--tp-mult", type=float, default=None, help="Take profit ATR multiplier")
+    parser.add_argument("--sl-mult", type=float, default=None, help="Stop loss ATR multiplier")
+    parser.add_argument("--be-trigger", type=float, default=None, help="Breakeven ATR trigger")
+    parser.add_argument("--tp1-bps", type=float, default=None, help="Tier 1 take profit in bps")
     parser.add_argument("--no-tiered-tp", action="store_true", help="Disable 2-Tier Lock & Run take-profit")
     args = parser.parse_args()
 
-    config = AppConfig()
-    config.risk.allocated_capital_usd = args.capital
-    config.risk.default_leverage = args.leverage
-    config.execution.bracket_tp_atr_mult = args.tp_mult
-    config.execution.bracket_sl_atr_mult = args.sl_mult
-    config.execution.breakeven_atr_trigger = args.be_trigger
-    config.execution.tp1_bps = args.tp1_bps
-    config.execution.tiered_tp_enabled = not args.no_tiered_tp
+    config = load_config(BASE_DIR)
+
+    initial_capital = args.capital if args.capital is not None else config.risk.allocated_capital_usd
+    if args.capital is not None:
+        config.risk.allocated_capital_usd = args.capital
+    if args.leverage is not None:
+        config.risk.default_leverage = args.leverage
+    if args.tp_mult is not None:
+        config.execution.bracket_tp_atr_mult = args.tp_mult
+    if args.sl_mult is not None:
+        config.execution.bracket_sl_atr_mult = args.sl_mult
+    if args.be_trigger is not None:
+        config.execution.breakeven_atr_trigger = args.be_trigger
+    if args.tp1_bps is not None:
+        config.execution.tp1_bps = args.tp1_bps
+    if args.no_tiered_tp:
+        config.execution.tiered_tp_enabled = False
 
     bars = HistoricalDataFetcher.fetch_klines(
         symbol=args.symbol,
@@ -625,10 +634,10 @@ def main() -> None:
 
     backtester = QuantitativeBacktester(
         config=config,
-        initial_capital=args.capital,
+        initial_capital=initial_capital,
     )
 
-    console.print(f"[bold green]Running simulation on {len(bars)} bars with ${args.capital:.2f} capital...[/bold green]")
+    console.print(f"[bold green]Running simulation on {len(bars)} bars with ${initial_capital:.2f} capital...[/bold green]")
     result = backtester.run(args.symbol, bars)
     render_backtest_report(result)
 
