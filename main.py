@@ -7,6 +7,7 @@ maker-first execution, risk management circuit breakers, and status IPC.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ from config import (
     load_credentials,
     save_config,
 )
-from risk_manager import Position, RiskManager, _to_float, _to_int, format_qty
+from risk_manager import Position, RiskManager, _to_float, _to_int, format_price, format_qty
 from strategy import MarketRegime, Signal, StrategyEngine, TimeframeSeries
 from telegram_notifier import TelegramNotifier
 from trade_journal import ParameterAutoTuner, TradeJournal, TradeRecord
@@ -71,7 +72,19 @@ class TradingEngine:
         self._last_trade_exit: Dict[str, float] = {}
         self._last_pos_heartbeat: float = 0.0
         self._processed_closed_trades: set[str] = set()
+        self._event_feed: collections.deque = collections.deque(maxlen=30)
         self.status_file = self.config.data_dir / "engine_status.json"
+        self._record_event("SYSTEM", "Autonomous trading engine initialized", "info")
+
+    def _record_event(self, category: str, message: str, level: str = "info") -> None:
+        """Records a timestamped telemetry event for the web and CLI dashboards."""
+        self._event_feed.appendleft({
+            "timestamp": int(time.time() * 1000),
+            "time_str": time.strftime("%H:%M:%S", time.localtime()),
+            "category": category,
+            "message": message,
+            "level": level,
+        })
 
     async def apply_capital_tier(self, total_equity: float, force: bool = False) -> None:
         """
@@ -96,7 +109,7 @@ class TradingEngine:
         self.config.risk.max_position_equity_pct = tier_cfg["max_position_equity_pct"]
         self.config.risk.default_leverage = tier_cfg["default_leverage"]
         self.config.strategy.auto_tuning_trade_interval = tier_cfg["auto_tuning_interval"]
-        self.config.strategy.symbols = tier_cfg["symbols"]
+        self.config.strategy.symbols = list(tier_cfg["symbols"])
 
         logger.info(
             f"⚡ [AUTO-CONFIG] Detected Available Funds: ${total_equity:,.2f} USD\n"
@@ -107,6 +120,11 @@ class TradingEngine:
             f"  • Max Daily Risk: {tier_cfg['max_daily_risk_pct']}%\n"
             f"  • Kelly Position Sizing: {tier_cfg['min_position_equity_pct']}% - {tier_cfg['max_position_equity_pct']}%\n"
             f"  • Default Leverage: {tier_cfg['default_leverage']}x"
+        )
+        self._record_event(
+            "TIER",
+            f"Capital tier set to {tier.value} (${total_equity:,.2f}) • Pairs: {', '.join(tier_cfg['symbols'])}",
+            "info",
         )
 
         # Ensure all tier symbols are initialized in the strategy series and subscribed
@@ -148,6 +166,18 @@ class TradingEngine:
         logger.info("Initializing Bybit V5 Autonomous Engine...")
         await self.client.initialize()
         await self.telegram.initialize()
+
+        # 0. Hydrate rolling trade memory from local SQLite journal for immediate Kelly sizing
+        try:
+            past_trades = self.journal.get_recent_trades(limit=50)
+            for t in reversed(past_trades):
+                pnl_val = _to_float(t.get("realized_pnl"))
+                if pnl_val != 0.0:
+                    self.strategy.rolling_trades.append(pnl_val)
+            if len(self.strategy.rolling_trades) > 50:
+                self.strategy.rolling_trades = self.strategy.rolling_trades[-50:]
+        except Exception as e:
+            logger.debug(f"Could not hydrate rolling trades from journal: {e}")
 
         # 1. Fetch initial wallet balance and auto-adapt parameters to available funds
         wallet_res = {}
@@ -219,6 +249,17 @@ class TradingEngine:
             for tf in self.config.strategy.timeframes:
                 self.client.subscribe_kline(symbol, tf)
 
+        # Ensure BTCUSDT klines are primed & subscribed for the BTC Lead-Lag Macro Filter
+        if getattr(self.config.strategy, "lead_lag_filter", True) and "BTCUSDT" not in self.config.strategy.symbols:
+            for tf in ("1m", "5m"):
+                try:
+                    btc_klines = await self.client.get_klines(symbol="BTCUSDT", interval=tf, limit=100)
+                    for k in btc_klines:
+                        self.strategy.update_kline("BTCUSDT", tf, k)
+                    self.client.subscribe_kline("BTCUSDT", tf)
+                except Exception as e:
+                    logger.debug(f"Could not prime BTCUSDT reference klines ({tf}): {e}")
+
         # 4. Attach event callbacks
         self.client.kline_callbacks.append(self._on_kline_update)
         self.client.execution_callbacks.append(self._on_execution_update)
@@ -228,11 +269,16 @@ class TradingEngine:
 
         # 5. Perform initial state reconciliation and hydrate past trade memory
         await self.risk_manager.reconcile()
-        await self._sync_closed_pnl()
+        await self._sync_closed_pnl(is_initial=True)
 
         # 6. Start WebSocket streaming
         await self.client.start_streams()
         self._running = True
+        self._record_event(
+            "SYSTEM",
+            f"Streams live ({self.config.trading_mode.value.upper()}) • Active pairs: {', '.join(self.config.strategy.symbols)}",
+            "success",
+        )
 
         await self.telegram.send_message(
             f"🚀 *Bybit Autonomous Engine Started*\n"
@@ -275,6 +321,11 @@ class TradingEngine:
                         new_sl = update.get("new_sl")
                         pnl_est = update.get("pnl_estimate", 0.0)
                         pnl_sign = "+" if pnl_est >= 0 else ""
+                        self._record_event(
+                            "TIER1",
+                            f"{sym} banked 50% ({close_qty}) est {pnl_sign}${pnl_est:.4f} • SL locked @ ${new_sl}",
+                            "success",
+                        )
                         await self.telegram.send_message(
                             f"🎯 *2-Tier Lock & Run Banked: {sym}*\n"
                             f"• Side: `{update['side']}` | Banked 50%: `{close_qty}`\n"
@@ -285,6 +336,11 @@ class TradingEngine:
                         asyncio.create_task(self._sync_closed_pnl(sym))
                     else:
                         new_sl = update["new_sl"]
+                        self._record_event(
+                            "BREAKEVEN",
+                            f"{sym} ({update['side']}) stop-loss advanced to breakeven @ ${new_sl}",
+                            "info",
+                        )
                         await self.telegram.send_message(
                             f"🛡️ *Breakeven Protected: {sym}*\n"
                             f"• Side: `{update['side']}`\n"
@@ -298,6 +354,11 @@ class TradingEngine:
                 for closed in stagnant_closed:
                     sym = closed["symbol"]
                     dur = closed["duration_mins"]
+                    self._record_event(
+                        "GUARDIAN",
+                        f"{sym} exited after {dur}m stagnation @ ${closed['mark_price']:.4f}",
+                        "warn",
+                    )
                     await self.telegram.send_message(
                         f"⏳ *Stagnant Position Exited: {sym}*\n"
                         f"• Position open for `{dur}` minutes without price expansion.\n"
@@ -327,6 +388,11 @@ class TradingEngine:
                     is_spike = self.risk_manager.evaluate_volatility_spike(symbol, atr, is_closed_bar=is_closed, price=close_px)
                     if is_spike:
                         cooldown_mins = getattr(self.risk_manager.risk_cfg, "volatility_kill_cooldown_mins", 30)
+                        self._record_event(
+                            "RISK",
+                            f"Volatility Kill Switch tripped on {symbol} (ATR={atr:.4f}) • Halting {cooldown_mins}m",
+                            "danger",
+                        )
                         await self.telegram.send_circuit_breaker_alert(
                             "Volatility Spike Kill Switch",
                             f"Extreme ATR spike detected on {symbol} (ATR={atr:.4f}). Halting new orders for {cooldown_mins}m.",
@@ -351,23 +417,26 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Error handling execution update: {e}")
 
-    async def _sync_closed_pnl(self, symbol: Optional[str] = None) -> None:
+    async def _sync_closed_pnl(self, symbol: Optional[str] = None, is_initial: bool = False) -> None:
         """
         Fetches realized closed PnL records directly from Bybit /v5/position/closed-pnl.
         Reliably updates TradeJournal, OnlineStrategyLearner, RiskManager, and AutoTuner.
+        Processes records in chronological order (oldest -> newest) and deduplicates against SQLite.
         """
         try:
             records = await self.client.get_closed_pnl(symbol=symbol, limit=20)
             if not records:
                 return
 
-            for rec in records:
+            # Process oldest to newest so streak and learning state advance chronologically
+            for rec in reversed(records):
                 order_id = str(rec.get("orderId") or rec.get("id") or "")
                 rec_sym = rec.get("symbol", "")
                 if not rec_sym:
                     continue
 
                 updated_time = int(rec.get("updatedTime") or rec.get("createdTime") or (time.time() * 1000))
+                trade_id = order_id or f"closed_{updated_time}"
                 record_key = f"{rec_sym}_{order_id}_{updated_time}"
                 if record_key in self._processed_closed_trades:
                     continue
@@ -380,6 +449,10 @@ class TradingEngine:
                 if len(self._processed_closed_trades) > 1000:
                     self._processed_closed_trades = set(list(self._processed_closed_trades)[-500:])
 
+                already_in_db = self.journal.has_trade(trade_id)
+                if already_in_db:
+                    continue
+
                 exit_price = float(rec.get("avgExitPrice") or rec.get("orderPrice") or 0.0)
                 entry_price = float(rec.get("avgEntryPrice") or 0.0)
                 qty = float(rec.get("closedSize") or rec.get("qty") or 0.0)
@@ -387,8 +460,12 @@ class TradingEngine:
                 order_type = rec.get("orderType", "Limit")
                 fee_paid = float(rec.get("execFee", 0.0))
 
-                # Context from order or position placement
-                ctx = self._position_context.pop(rec_sym, {})
+                # Preserve position context if a partial runner is still open on this symbol
+                if rec_sym in self.risk_manager.positions:
+                    ctx = dict(self._position_context.get(rec_sym, {}))
+                else:
+                    ctx = self._position_context.pop(rec_sym, {})
+
                 if not entry_price and ctx.get("price"):
                     entry_price = float(ctx["price"])
                 entry_ts = int(ctx.get("placed_at", (updated_time / 1000.0) - 30.0) * 1000)
@@ -398,19 +475,9 @@ class TradingEngine:
                 pnl_pct = (closed_pnl / notional) * 100.0
                 regime_str = str(ctx.get("regime", "TREND_PULLBACK"))
 
-                # 1. Update risk manager metrics
-                self.risk_manager.record_trade_fill(closed_pnl)
-
-                # 2. Update strategy engine memory & online reinforcement learner
-                self.strategy.record_trade_result(
-                    pnl=closed_pnl,
-                    regime=regime_str,
-                    metadata=ctx,
-                )
-
-                # 3. Create persistent trade journal record
+                # Create persistent trade journal record
                 tr = TradeRecord(
-                    trade_id=order_id or f"closed_{updated_time}",
+                    trade_id=trade_id,
                     symbol=rec_sym,
                     side=side,
                     entry_time=entry_ts,
@@ -432,7 +499,31 @@ class TradingEngine:
                     ofi_at_entry=float(ctx.get("ofi", 0.0)),
                 )
                 self.journal.record_trade(tr)
+
+                if is_initial:
+                    # Hydrate rolling trade memory without firing duplicate alerts or tripping cooldowns on old history
+                    self.strategy.rolling_trades.append(closed_pnl)
+                    if len(self.strategy.rolling_trades) > 50:
+                        self.strategy.rolling_trades.pop(0)
+                    continue
+
+                # 1. Update live risk manager metrics
+                self.risk_manager.record_trade_fill(closed_pnl)
+
+                # 2. Update strategy engine memory & online reinforcement learner
+                self.strategy.record_trade_result(
+                    pnl=closed_pnl,
+                    regime=regime_str,
+                    metadata=ctx,
+                )
+
                 self._last_trade_exit[rec_sym] = time.time()
+                pnl_sign = "+" if closed_pnl >= 0 else ""
+                self._record_event(
+                    "EXIT",
+                    f"{rec_sym} {side} closed @ ${exit_price:.4f} • PnL: {pnl_sign}${closed_pnl:.2f} ({pnl_sign}{pnl_pct:.2f}%)",
+                    "success" if closed_pnl >= 0 else "warn",
+                )
 
                 # 4. Dispatch Telegram exit alert
                 await self.telegram.send_trade_exit(
@@ -447,6 +538,7 @@ class TradingEngine:
                 # 5. Evaluate dynamic parameter auto-tuning
                 tuning_res = self.auto_tuner.evaluate_and_tune()
                 if tuning_res:
+                    self._record_event("TUNER", tuning_res["rationale"], "info")
                     await self.telegram.send_message(
                         f"⚙️ *Self-Adaptive Tuning Activated*\n{tuning_res['rationale']}"
                     )
@@ -702,6 +794,11 @@ class TradingEngine:
                     f"✅ [{sig.symbol}] Market order executed! OrderID: {order_id} "
                     f"({sig.side} {qty}, TP: {tp_price}, SL: {sl_price})"
                 )
+                self._record_event(
+                    "ENTRY",
+                    f"{sig.symbol} {sig.side} {qty} @ ${sig.price} (Market • {sig.regime.value})",
+                    "info",
+                )
                 await self.telegram.send_trade_entry(
                     symbol=sig.symbol,
                     side=sig.side,
@@ -748,6 +845,11 @@ class TradingEngine:
                 f"✅ [{sig.symbol}] Maker PostOnly order placed on book! OrderID: {order_id} "
                 f"({sig.side} {qty} @ ${sig.price}, Notional: ${actual_notional:.2f})"
             )
+            self._record_event(
+                "ENTRY",
+                f"{sig.symbol} {sig.side} {qty} @ ${sig.price} (Maker PostOnly • {sig.regime.value})",
+                "info",
+            )
             await self.telegram.send_trade_entry(
                 symbol=sig.symbol,
                 side=sig.side,
@@ -765,20 +867,7 @@ class TradingEngine:
 
     def _format_price(self, symbol: str, price: Optional[float]) -> Optional[float]:
         """Rounds price to symbol tick size precision on Bybit V5."""
-        if price is None or price <= 0:
-            return None
-        sym = symbol.upper()
-        if "BTC" in sym:
-            return round(price, 1)
-        elif "ETH" in sym or "SOL" in sym:
-            return round(price, 2)
-        elif "AVAX" in sym or "LINK" in sym:
-            return round(price, 3)
-        elif "SUI" in sym or "XRP" in sym or "ADA" in sym:
-            return round(price, 4)
-        elif "DOGE" in sym:
-            return round(price, 5)
-        return round(price, 4)
+        return format_price(symbol, price)
 
     def _format_qty(self, symbol: str, raw_qty: float) -> float:
         """Rounds quantity to symbol lot size precision on Bybit V5."""
@@ -816,6 +905,16 @@ class TradingEngine:
 
             candidates = []
             min_turnover = float(self.config.strategy.scanner_min_turnover_usd)
+            max_pct = getattr(self.config.risk, "max_position_equity_pct", 25.0)
+            equity = (
+                self.risk_manager.current_equity
+                if self.risk_manager.current_equity > 0
+                else self.config.risk.allocated_capital_usd
+            )
+            effective_cap = max(
+                equity * (max_pct / 100.0),
+                6.0 * max(1, self.config.risk.default_leverage),
+            )
             excluded = {
                 "USDCUSDT", "FDUSDUSDT", "USDEUSDT", "USDYUSDT", "BUSDUSDT",
                 "USUSDT", "EURUSDT", "TUSDUSDT", "CUSDUSDT", "USD0USDT"
@@ -835,6 +934,11 @@ class TradingEngine:
 
                 last_price = _to_float(t.get("lastPrice"))
                 if last_price <= 0:
+                    continue
+
+                # Ensure minimum lot notional fits within the account's position risk cap
+                min_lot_qty = format_qty(sym, 0.0)
+                if (min_lot_qty * last_price) > (effective_cap * 1.05):
                     continue
 
                 high = _to_float(t.get("highPrice24h"))
@@ -877,6 +981,11 @@ class TradingEngine:
                 logger.info(
                     f"🔄 [VOLATILITY SCANNER] Symbol rotation: Old: {current_symbols} -> "
                     f"New: {selected_symbols} (Added: {added}, Removed: {removed})"
+                )
+                self._record_event(
+                    "SCANNER",
+                    f"Rotated pairs -> {', '.join(selected_symbols)} (Added: {', '.join(added or ['None'])})",
+                    "info",
                 )
 
                 # Initialize leverage, klines, and subscriptions for new pairs
@@ -956,8 +1065,10 @@ class TradingEngine:
                 await asyncio.sleep(2.0)
 
     def get_status_dict(self) -> Dict[str, Any]:
-        """Collects live state snapshot for terminal dashboard & Telegram."""
+        """Collects live state snapshot for terminal dashboard, web UI & Telegram."""
         summary = self.journal.get_summary_metrics()
+        window_24h = self.journal.get_window_metrics(hours=24)
+        recent_trades = self.journal.get_recent_trades(limit=10)
         pos_list = [
             {
                 "symbol": p.symbol,
@@ -967,9 +1078,44 @@ class TradingEngine:
                 "mark_price": p.mark_price,
                 "unrealised_pnl": p.unrealised_pnl,
                 "leverage": p.leverage,
+                "tp_price": p.take_profit,
+                "sl_price": p.stop_loss,
+                "tp1_price": p.tp1_price,
+                "tp1_filled": p.tp1_filled,
+                "breakeven_set": p.breakeven_set,
+                "opened_at": int(p.opened_at),
             }
             for p in self.risk_manager.positions.values()
         ]
+
+        # Build per-symbol live telemetry & determine dominant regime
+        symbol_telemetry: Dict[str, Dict[str, Any]] = {}
+        active_regime = MarketRegime.LOW_VOL_CHOP.value
+        for sym in self.config.strategy.symbols:
+            ob = self.client.orderbooks.get(sym)
+            try:
+                regime_res = self.strategy.classify_regime(sym, ob)
+                regime_enum = regime_res[0] if isinstance(regime_res, tuple) else regime_res
+                regime_val = regime_enum.value
+                if active_regime == MarketRegime.LOW_VOL_CHOP.value and regime_val != MarketRegime.LOW_VOL_CHOP.value:
+                    active_regime = regime_val
+            except Exception:
+                regime_val = MarketRegime.LOW_VOL_CHOP.value
+
+            symbol_telemetry[sym] = {
+                "regime": regime_val,
+                "mid_price": round(ob.mid_price, 6) if ob and ob.mid_price > 0 else 0.0,
+                "spread_bps": round(ob.spread_bps, 2) if ob else 0.0,
+                "ofi": round(float(getattr(ob, "ofi", 0.0)), 3) if ob else 0.0,
+                "funding_rate": self._funding_rates.get(sym, 0.0),
+            }
+
+        hwm = self.risk_manager.high_water_mark
+        if hwm is None or hwm <= 0:
+            hwm = self.risk_manager.current_equity
+
+        kelly_fraction = self.strategy.calculate_kelly_fraction()
+
         return {
             "timestamp": int(time.time()),
             "status": "RUNNING" if not self.risk_manager.panic_triggered else "PANIC_HALTED",
@@ -979,19 +1125,20 @@ class TradingEngine:
             "capital_tier": self.config.risk.current_tier.value,
             "auto_tier_enabled": self.config.risk.auto_tier_by_equity,
             "symbols": self.config.strategy.symbols,
+            "current_regime": active_regime,
+            "symbol_telemetry": symbol_telemetry,
             "max_open_positions": self.config.risk.max_open_positions,
-            "high_water_mark": round(self.risk_manager.high_water_mark, 2),
+            "high_water_mark": round(hwm, 2),
             "daily_drawdown_pct": round(
-                (
-                    (self.risk_manager.high_water_mark - self.risk_manager.current_equity)
-                    / max(1.0, self.risk_manager.high_water_mark)
-                )
-                * 100.0,
+                max(0.0, ((hwm - self.risk_manager.current_equity) / max(1.0, hwm)) * 100.0),
                 2,
             ),
+            "last_reconciliation_ts": int(self.risk_manager.last_reconciliation_ts),
             "circuit_breakers": {
                 "daily_drawdown_tripped": self.risk_manager.daily_drawdown_tripped,
+                "max_daily_drawdown_pct": self.config.risk.max_daily_risk_pct,
                 "consecutive_losses": self.risk_manager.consecutive_losses,
+                "max_consecutive_losses": self.config.risk.max_consecutive_losses,
                 "in_cooldown": time.time() < self.risk_manager.cooldown_until,
                 "cooldown_remaining_sec": max(
                     0, int(self.risk_manager.cooldown_until - time.time())
@@ -1002,12 +1149,18 @@ class TradingEngine:
                 ) if self.risk_manager.volatility_kill_tripped else 0,
             },
             "metrics": summary,
+            "window_24h": window_24h,
             "positions": pos_list,
             "pending_orders": len(self._pending_orders),
+            "recent_trades": recent_trades,
+            "recent_events": list(self._event_feed),
+            "learner_weights": self.journal.learner.get_weights_summary(),
             "parameters": {
                 "tp_atr_mult": self.config.execution.bracket_tp_atr_mult,
                 "sl_atr_mult": self.config.execution.bracket_sl_atr_mult,
                 "kelly_scale": self.config.strategy.kelly_scale,
+                "kelly_fraction_pct": round(kelly_fraction * 100.0, 2),
+                "default_leverage": self.config.risk.default_leverage,
             },
         }
 

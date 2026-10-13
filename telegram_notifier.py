@@ -78,10 +78,19 @@ class TelegramNotifier:
             async with self.session.post(url, json=payload) as resp:
                 if resp.status == 200:
                     return True
-                else:
-                    body = await resp.text()
-                    logger.warning(f"Telegram API responded with {resp.status}: {body}")
-                    return False
+                body = await resp.text()
+                if resp.status == 400 and parse_mode:
+                    # Fallback to plain text if Markdown entity parsing fails
+                    fallback_payload = {
+                        "chat_id": self.chat_id,
+                        "text": text,
+                        "disable_web_page_preview": True,
+                    }
+                    async with self.session.post(url, json=fallback_payload) as retry_resp:
+                        if retry_resp.status == 200:
+                            return True
+                logger.warning(f"Telegram API responded with {resp.status}: {body}")
+                return False
         except Exception as e:
             logger.error(f"Failed to dispatch Telegram message: {e}")
             return False

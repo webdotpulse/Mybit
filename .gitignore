@@ -18,7 +18,10 @@ logs/
 *.sqlite3
 *.log
 
-# IDE & OS
+# IDE, Test Cache & Generated Units
 .vscode/
 .idea/
 .DS_Store
+.pytest_cache/
+bybit-engine.service
+

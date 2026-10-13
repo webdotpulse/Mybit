@@ -262,7 +262,7 @@ case "$COMMAND" in
         if [ -f "logs/engine.log" ]; then
             tail -n 50 -f logs/engine.log
         else
-            $SYSTEMCTL_CMD logs -u bybit-engine -f || journalctl --user -u bybit-engine -f
+            journalctl -u bybit-engine -f 2>/dev/null || journalctl --user -u bybit-engine -f
         fi
         ;;
 

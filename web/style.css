@@ -275,11 +275,13 @@ body {
   gap: 0.6rem;
 }
 
-/* ACTIVE POSITIONS TABLE */
+/* ACTIVE POSITIONS & TRADES TABLES (Container Query Responsive) */
 .table-wrapper {
+  container-type: inline-size;
   overflow-x: auto;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
+  overscroll-behavior-x: contain;
 }
 
 table {
@@ -298,6 +300,7 @@ th {
   letter-spacing: 0.5px;
   padding: 0.85rem 1rem;
   border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
 }
 
 td {
@@ -305,6 +308,18 @@ td {
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   font-family: var(--font-mono);
   color: var(--text-primary);
+  white-space: nowrap;
+}
+
+@container (max-width: 680px) {
+  th:first-child,
+  td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    background: #0d121d;
+    box-shadow: 1px 0 0 var(--border-subtle);
+  }
 }
 
 tr:hover td {
@@ -340,7 +355,27 @@ tr:hover td {
   border-radius: 10px;
   background: linear-gradient(135deg, rgba(0, 240, 255, 0.08), rgba(138, 43, 226, 0.08));
   border: 1px solid var(--border-accent);
-  margin-bottom: 1.25rem;
+}
+
+.symbol-radar-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.symbol-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 6px;
+  background: rgba(7, 9, 14, 0.65);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
 }
 
 .regime-info {
@@ -355,6 +390,7 @@ tr:hover td {
   border-radius: 50%;
   background: var(--accent-cyan);
   box-shadow: 0 0 10px var(--accent-cyan);
+  flex-shrink: 0;
 }
 
 .regime-text h4 {
@@ -552,17 +588,84 @@ tr:hover td {
   box-shadow: 0 6px 25px rgba(0, 240, 255, 0.5);
 }
 
+/* NATIVE DIALOG MODAL */
+.panic-modal {
+  margin: auto;
+  max-width: 460px;
+  width: 92%;
+  background: #0d121d;
+  color: var(--text-primary);
+  border: 1px solid var(--accent-rose);
+  border-radius: 14px;
+  padding: 1.75rem;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.9), 0 0 30px var(--accent-rose-glow);
+}
+
+.panic-modal::backdrop {
+  background: rgba(7, 9, 14, 0.75);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.panic-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+
+.panic-modal-header h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.panic-modal-body {
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  margin-bottom: 1.5rem;
+}
+
+.panic-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.btn-modal-cancel {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 0.55rem 1.1rem;
+  font-family: var(--font-main);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-modal-cancel:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* TOP-LAYER POPOVER TOAST */
 .toast {
   position: fixed;
-  bottom: 2rem;
-  right: 2rem;
-  background: var(--bg-card);
+  inset: auto 2rem 2rem auto;
+  margin: 0;
+  background: rgba(13, 18, 29, 0.95);
+  backdrop-filter: blur(12px);
   border: 1px solid var(--border-accent);
   padding: 1rem 1.5rem;
   border-radius: 8px;
   color: #fff;
   font-size: 0.85rem;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.85);
   display: none;
   z-index: 1000;
+}
+
+.toast:popover-open {
+  display: block;
 }

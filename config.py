@@ -5,7 +5,6 @@ Validates parameters with Pydantic v2 and enforces strict security via Fernet en
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import stat
@@ -14,8 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from pydantic import BaseModel, Field, field_validator
 
 

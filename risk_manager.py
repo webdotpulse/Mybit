@@ -40,6 +40,24 @@ def _to_int(val: Any, default: int = 1) -> int:
         return default
 
 
+def format_price(symbol: str, price: Optional[float]) -> Optional[float]:
+    """Rounds price to symbol tick size precision on Bybit V5."""
+    if price is None or price <= 0:
+        return None
+    sym = symbol.upper()
+    if "BTC" in sym:
+        return round(price, 1)
+    elif "ETH" in sym or "SOL" in sym:
+        return round(price, 2)
+    elif "AVAX" in sym or "LINK" in sym:
+        return round(price, 3)
+    elif any(k in sym for k in ("SUI", "XRP", "ADA")):
+        return round(price, 4)
+    elif "DOGE" in sym:
+        return round(price, 5)
+    return round(price, 4)
+
+
 def format_qty(symbol: str, raw_qty: float) -> float:
     """Rounds quantity to symbol lot size precision on Bybit V5."""
     sym = symbol.upper()
@@ -424,7 +442,8 @@ class RiskManager:
                 if tp1_hit:
                     raw_close_qty = pos.size * exec_cfg.tp1_ratio
                     close_qty = format_qty(pos.symbol, raw_close_qty)
-                    new_sl = round(pos.entry_price + fee_buffer, 4) if pos.side == "Buy" else round(pos.entry_price - fee_buffer, 4)
+                    raw_sl = pos.entry_price + fee_buffer if pos.side == "Buy" else pos.entry_price - fee_buffer
+                    new_sl = format_price(pos.symbol, raw_sl) or round(raw_sl, 4)
 
                     if 0 < close_qty < pos.size:
                         close_side = "Sell" if pos.side == "Buy" else "Buy"
@@ -491,7 +510,8 @@ class RiskManager:
                     if pos.side == "Buy":
                         # For Long: if mark_price >= entry_price + trigger_dist
                         if pos.mark_price >= (pos.entry_price + trigger_dist):
-                            new_sl = round(pos.entry_price + fee_buffer, 4)
+                            raw_sl = pos.entry_price + fee_buffer
+                            new_sl = format_price(pos.symbol, raw_sl) or round(raw_sl, 4)
                             if pos.stop_loss is None or new_sl > pos.stop_loss:
                                 logger.info(
                                     f"🛡️ [{symbol}] Advancing Stop Loss to Breakeven (+${fee_buffer:.4f} fee buffer): "
@@ -516,7 +536,8 @@ class RiskManager:
                     elif pos.side == "Sell":
                         # For Short: if mark_price <= entry_price - trigger_dist
                         if pos.mark_price <= (pos.entry_price - trigger_dist):
-                            new_sl = round(pos.entry_price - fee_buffer, 4)
+                            raw_sl = pos.entry_price - fee_buffer
+                            new_sl = format_price(pos.symbol, raw_sl) or round(raw_sl, 4)
                             if pos.stop_loss is None or new_sl < pos.stop_loss:
                                 logger.info(
                                     f"🛡️ [{symbol}] Advancing Short Stop Loss to Breakeven (-${fee_buffer:.4f} fee buffer): "

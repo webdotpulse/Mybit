@@ -1368,4 +1368,248 @@ async def test_position_reconciliation_recovery_from_restart():
     assert doge_pos.mark_price == 0.0852
 
 
+def test_window_metrics_millisecond_cutoff_accuracy():
+    """Verifies that get_window_metrics(hours=24) filters by millisecond timestamps accurately."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "trading_journal.db"
+        journal = TradeJournal(db_path)
+
+        now_ms = int(time.time() * 1000)
+        old_ms = now_ms - (48 * 3600 * 1000)  # 48 hours ago
+
+        # 1. Old trade (48h ago) -> should be excluded from 24h window
+        journal.record_trade(TradeRecord(
+            trade_id="old_trade_48h",
+            symbol="BTCUSDT",
+            side="Buy",
+            entry_time=old_ms - 60000,
+            exit_time=old_ms,
+            holding_time_sec=60.0,
+            entry_price=60000.0,
+            exit_price=59000.0,
+            qty=0.01,
+            realized_pnl=-10.0,
+            realized_pnl_pct=-1.6,
+            fee_paid=0.1,
+            slippage_bps=1.0,
+            order_type="Limit",
+            regime="TREND_PULLBACK",
+            conviction=0.8,
+            atr_at_entry=50.0,
+            ema_spread_at_entry=10.0,
+            vwap_delta_at_entry=5.0,
+            ofi_at_entry=2.0,
+        ))
+
+        # 2. Recent trade (1h ago) -> should be included in 24h window
+        recent_ms = now_ms - (3600 * 1000)
+        journal.record_trade(TradeRecord(
+            trade_id="recent_trade_1h",
+            symbol="SOLUSDT",
+            side="Buy",
+            entry_time=recent_ms - 60000,
+            exit_time=recent_ms,
+            holding_time_sec=60.0,
+            entry_price=150.0,
+            exit_price=153.0,
+            qty=1.0,
+            realized_pnl=3.0,
+            realized_pnl_pct=2.0,
+            fee_paid=0.05,
+            slippage_bps=0.5,
+            order_type="Limit",
+            regime="TREND_PULLBACK",
+            conviction=0.9,
+            atr_at_entry=0.5,
+            ema_spread_at_entry=0.2,
+            vwap_delta_at_entry=0.1,
+            ofi_at_entry=3.0,
+        ))
+
+        assert journal.has_trade("old_trade_48h") is True
+        assert journal.has_trade("recent_trade_1h") is True
+        assert journal.has_trade("nonexistent") is False
+
+        w24 = journal.get_window_metrics(hours=24)
+        assert w24["total_trades"] == 1
+        assert w24["wins"] == 1
+        assert w24["losses"] == 0
+        assert w24["total_pnl"] == 3.0
+
+
+def test_autotuner_interval_gating():
+    """Verifies that ParameterAutoTuner only tunes once per auto_tuning_trade_interval."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "trading_journal.db"
+        journal = TradeJournal(db_path)
+        cfg = AppConfig()
+        cfg.strategy.auto_tuning_trade_interval = 5
+        tuner = ParameterAutoTuner(journal, cfg)
+
+        now_ms = int(time.time() * 1000)
+        for i in range(5):
+            journal.record_trade(TradeRecord(
+                trade_id=f"t_{i}",
+                symbol="SOLUSDT",
+                side="Buy",
+                entry_time=now_ms + i * 1000,
+                exit_time=now_ms + (i + 1) * 1000,
+                holding_time_sec=10.0,
+                entry_price=100.0,
+                exit_price=102.0,
+                qty=1.0,
+                realized_pnl=2.0,
+                realized_pnl_pct=2.0,
+                fee_paid=0.02,
+                slippage_bps=0.5,
+                order_type="Limit",
+                regime="TREND_PULLBACK",
+                conviction=0.8,
+                atr_at_entry=0.5,
+                ema_spread_at_entry=0.1,
+                vwap_delta_at_entry=0.1,
+                ofi_at_entry=1.0,
+            ))
+
+        # At 5 trades (1st interval), tuner should fire
+        res1 = tuner.evaluate_and_tune()
+        assert res1 is not None
+
+        # Add 1 more trade (total 6 < next interval 10) -> tuner must NOT fire again
+        journal.record_trade(TradeRecord(
+            trade_id="t_5",
+            symbol="SOLUSDT",
+            side="Buy",
+            entry_time=now_ms + 6000,
+            exit_time=now_ms + 7000,
+            holding_time_sec=10.0,
+            entry_price=100.0,
+            exit_price=102.0,
+            qty=1.0,
+            realized_pnl=2.0,
+            realized_pnl_pct=2.0,
+            fee_paid=0.02,
+            slippage_bps=0.5,
+            order_type="Limit",
+            regime="TREND_PULLBACK",
+            conviction=0.8,
+            atr_at_entry=0.5,
+            ema_spread_at_entry=0.1,
+            vwap_delta_at_entry=0.1,
+            ofi_at_entry=1.0,
+        ))
+        res2 = tuner.evaluate_and_tune()
+        assert res2 is None
+
+
+def test_linreg_exact_ols_slope_and_r2():
+    """Verifies that calculate_linreg computes exact OLS slope and R^2=1.0 on a linear series."""
+    tf = TimeframeSeries("BTCUSDT", "1m")
+    for i in range(10):
+        px = 100.0 + (10.0 * i)
+        tf.add_or_update_bar(Bar(
+            timestamp=1700000000000 + i * 60000,
+            open=px,
+            high=px + 1.0,
+            low=px - 1.0,
+            close=px,
+            volume=10.0,
+        ))
+    slope, r2, forecast = tf.calculate_linreg(8)
+    assert abs(slope - 10.0) < 1e-6
+    assert abs(r2 - 1.0) < 1e-6
+    # Last close is 190.0, next bar forecast should be 200.0
+    assert abs(forecast - 200.0) < 1e-6
+
+
+@pytest.mark.asyncio
+async def test_startup_sync_closed_pnl_idempotency_and_chronology():
+    """Verifies that initial startup closed-PnL sync does not trip circuit breakers or send duplicate alerts."""
+    from main import TradingEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = AppConfig()
+        cfg.data_dir = Path(tmpdir)
+        cfg.risk.max_consecutive_losses = 3
+        creds = BybitCredentials(api_key="x" * 12, api_secret="y" * 16, testnet=True)
+        engine = TradingEngine(cfg, creds)
+
+        # Mock 4 historical losses returned newest-first by Bybit
+        engine.client.get_closed_pnl = AsyncMock(return_value=[
+            {"orderId": "loss_4", "symbol": "DOGEUSDT", "closedPnl": "-0.50", "avgEntryPrice": "0.10", "avgExitPrice": "0.095", "closedSize": "100", "side": "Buy", "updatedTime": "1700000040000"},
+            {"orderId": "loss_3", "symbol": "DOGEUSDT", "closedPnl": "-0.50", "avgEntryPrice": "0.10", "avgExitPrice": "0.095", "closedSize": "100", "side": "Buy", "updatedTime": "1700000030000"},
+            {"orderId": "loss_2", "symbol": "DOGEUSDT", "closedPnl": "-0.50", "avgEntryPrice": "0.10", "avgExitPrice": "0.095", "closedSize": "100", "side": "Buy", "updatedTime": "1700000020000"},
+            {"orderId": "loss_1", "symbol": "DOGEUSDT", "closedPnl": "-0.50", "avgEntryPrice": "0.10", "avgExitPrice": "0.095", "closedSize": "100", "side": "Buy", "updatedTime": "1700000010000"},
+        ])
+        engine.telegram.send_trade_exit = AsyncMock()
+
+        await engine._sync_closed_pnl(is_initial=True)
+
+        # Historical trades hydrated into SQLite and rolling_trades, but circuit breaker NOT tripped and no spam sent
+        assert engine.journal.has_trade("loss_1") is True
+        assert engine.journal.has_trade("loss_4") is True
+        assert engine.risk_manager.consecutive_losses == 0
+        assert engine.telegram.send_trade_exit.call_count == 0
+
+        # Subsequent live sync with the same records should be a no-op (deduplicated against DB/set)
+        await engine._sync_closed_pnl(is_initial=False)
+        assert engine.risk_manager.consecutive_losses == 0
+        assert engine.telegram.send_trade_exit.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_scanner_affordability_filter_for_micro_accounts():
+    """Verifies that _scan_and_update_symbols excludes high-notional pairs (like BTCUSDT) on micro accounts."""
+    from main import TradingEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = AppConfig()
+        cfg.data_dir = Path(tmpdir)
+        cfg.risk.allocated_capital_usd = 50.0
+        cfg.risk.max_position_equity_pct = 25.0
+        cfg.risk.default_leverage = 3
+        cfg.strategy.scanner_top_n = 2
+        cfg.strategy.symbols = ["DOGEUSDT"]
+        creds = BybitCredentials(api_key="x" * 12, api_secret="y" * 16, testnet=True)
+        engine = TradingEngine(cfg, creds)
+        engine.risk_manager.update_wallet_balance(50.0, is_initial=True)
+
+        # BTCUSDT has min lot 0.001 * $70,000 = $70 (> $18 effective cap), DOGE & SUI are < $1
+        engine.client.get_market_tickers = AsyncMock(return_value=[
+            {"symbol": "BTCUSDT", "turnover24h": "500000000", "lastPrice": "70000", "highPrice24h": "75000", "lowPrice24h": "65000", "price24hPcnt": "0.10"},
+            {"symbol": "DOGEUSDT", "turnover24h": "100000000", "lastPrice": "0.12", "highPrice24h": "0.13", "lowPrice24h": "0.11", "price24hPcnt": "0.08"},
+            {"symbol": "SUIUSDT", "turnover24h": "90000000", "lastPrice": "1.50", "highPrice24h": "1.65", "lowPrice24h": "1.40", "price24hPcnt": "0.09"},
+        ])
+        engine.client.set_leverage = AsyncMock()
+        engine.client.get_klines = AsyncMock(return_value=[])
+        engine.client.add_public_subscriptions = AsyncMock()
+        engine.telegram.send_message = AsyncMock()
+
+        await engine._scan_and_update_symbols()
+
+        assert "BTCUSDT" not in engine.config.strategy.symbols
+        assert set(engine.config.strategy.symbols) == {"DOGEUSDT", "SUIUSDT"}
+
+
+def test_status_dict_telemetry_completeness():
+    """Verifies get_status_dict safely handles uninitialized HWM and includes full UI telemetry."""
+    from main import TradingEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = AppConfig()
+        cfg.data_dir = Path(tmpdir)
+        creds = BybitCredentials(api_key="x" * 12, api_secret="y" * 16, testnet=True)
+        engine = TradingEngine(cfg, creds)
+
+        status = engine.get_status_dict()
+        assert status["status"] == "RUNNING"
+        assert "symbol_telemetry" in status
+        assert "window_24h" in status
+        assert "recent_trades" in status
+        assert "recent_events" in status
+        assert "learner_weights" in status
+        assert "kelly_fraction_pct" in status["parameters"]
+
+
+
 

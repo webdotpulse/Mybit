@@ -14,9 +14,9 @@
     <div class="brand">
       <div class="brand-icon">⚡</div>
       <div>
-        <div style="display: flex; align-items: center; gap: 0.6rem;">
+        <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
           <h1 class="brand-title">BYBIT V5 AUTONOMOUS ENGINE</h1>
-          <span class="brand-tag">UTA Linear</span>
+          <span class="brand-tag" id="mode-tag">UTA Linear</span>
           <span class="brand-tag" id="tier-tag" style="background: rgba(0, 240, 255, 0.15); color: var(--accent-cyan); border-color: rgba(0, 240, 255, 0.4);">TIER: AUTO-DETECTING</span>
           <span class="brand-tag" id="env-tag" style="background: rgba(0, 230, 118, 0.15); color: var(--accent-emerald); border-color: rgba(0, 230, 118, 0.4);">LIVE MAINNET</span>
         </div>
@@ -25,7 +25,7 @@
 
     <div class="nav-metrics">
       <div class="status-badge" id="engine-status-badge">
-        <span class="pulse-dot"></span>
+        <span class="pulse-dot" id="engine-pulse-dot"></span>
         <span id="engine-status-text">AUTONOMOUS RUNNING</span>
       </div>
       <div id="view-only-badge" style="display: none; align-items: center; gap: 0.4rem; padding: 0.45rem 0.85rem; border-radius: 6px; font-size: 0.8rem; font-weight: 700; color: #a0aec0; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); letter-spacing: 0.04em;">
@@ -33,7 +33,7 @@
         <span>VIEW ONLY</span>
       </div>
       <a id="nav-config-link" href="setup.html" style="color: var(--text-secondary); text-decoration: none; font-size: 0.85rem; font-weight: 600; padding: 0.5rem 0.8rem; border-radius: 6px; border: 1px solid var(--border-subtle);">⚙️ Configuration</a>
-      <button class="btn-panic" id="btn-panic" onclick="triggerPanic()">
+      <button class="btn-panic" id="btn-panic" type="button" onclick="openPanicModal()">
         <span>🛑</span>
         <span>PANIC STOP</span>
       </button>
@@ -54,6 +54,8 @@
         <div class="kpi-sub">
           <span>HWM:</span>
           <span id="kpi-hwm" style="color: #fff;">$1,000.00</span>
+          <span>•</span>
+          <span id="kpi-24h-pnl" class="positive">24h: +$0.00</span>
         </div>
       </div>
 
@@ -65,7 +67,7 @@
         <div class="kpi-value positive" id="kpi-drawdown">0.00%</div>
         <div class="kpi-sub">
           <span>Circuit Breaker:</span>
-          <span class="negative">2.50% Max</span>
+          <span class="negative" id="kpi-max-dd">2.50% Max</span>
         </div>
       </div>
 
@@ -88,8 +90,8 @@
           <span>📐</span>
         </div>
         <div class="kpi-value neutral" id="kpi-kelly">1.00%</div>
-        <div class="kpi-sub">
-          <span>Risk Band: 0.5% – 1.5%</span>
+        <div class="kpi-sub" id="kpi-kelly-sub">
+          <span>Leverage: 2x • Pending: 0</span>
         </div>
       </div>
     </section>
@@ -97,19 +99,24 @@
     <!-- Main 2-Column Section -->
     <div class="main-grid">
       
-      <!-- Left Column: Active Positions & Automated Trade Decisions -->
+      <!-- Left Column: Active Positions, Recent Trades & Automated Trade Decisions -->
       <div style="display: flex; flex-direction: column; gap: 1.5rem;">
         
-        <!-- Live Market Regime Status -->
+        <!-- Live Market Regime Status & Per-Symbol Radar -->
         <div class="regime-banner" id="regime-banner">
-          <div class="regime-info">
-            <div class="regime-indicator" id="regime-indicator"></div>
-            <div class="regime-text">
-              <h4 id="regime-name">REGIME: BULL_TREND DETECTED</h4>
-              <p id="regime-desc">EMA ribbon (9 > 21 > 50) aligned. Positive Order Flow Imbalance (OFI). Trend scalping active.</p>
+          <div style="display: flex; flex-direction: column; gap: 0.75rem; width: 100%;">
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;">
+              <div class="regime-info">
+                <div class="regime-indicator" id="regime-indicator"></div>
+                <div class="regime-text">
+                  <h4 id="regime-name">REGIME: BULL_TREND DETECTED</h4>
+                  <p id="regime-desc">EMA ribbon (9 > 21 > 50) aligned. Positive Order Flow Imbalance (OFI). Trend scalping active.</p>
+                </div>
+              </div>
+              <div class="regime-pill" id="regime-pill">CONFIDENCE: 85%</div>
             </div>
+            <div class="symbol-radar-row" id="symbol-radar-row"></div>
           </div>
-          <div class="regime-pill" id="regime-pill">CONFIDENCE: 85%</div>
         </div>
 
         <!-- Active Positions Card -->
@@ -134,8 +141,8 @@
                   <th>Entry Price</th>
                   <th>Mark Price</th>
                   <th>Unrealized PnL</th>
-                  <th>TP Bracket</th>
-                  <th>SL Bracket</th>
+                  <th>TP / Lock Status</th>
+                  <th>SL / Protection</th>
                   <th>Leverage</th>
                 </tr>
               </thead>
@@ -143,6 +150,40 @@
                 <tr>
                   <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 2rem;">
                     No active positions currently open. Engine scanning multi-timeframe feeds.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Recent Closed Trades Card -->
+        <div class="card">
+          <div class="section-header">
+            <h2 class="section-title">
+              <span>📜 Recent Realized Trades</span>
+              <span class="brand-tag" id="recent-trades-tag">0 Logged</span>
+            </h2>
+            <span class="brand-tag" style="background: rgba(0, 245, 155, 0.1); color: var(--accent-emerald); border-color: rgba(0, 245, 155, 0.3);">SQLite WAL Journal</span>
+          </div>
+
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Qty</th>
+                  <th>Entry / Exit</th>
+                  <th>Realized PnL</th>
+                  <th>Regime</th>
+                  <th>Hold Time</th>
+                </tr>
+              </thead>
+              <tbody id="trades-tbody">
+                <tr>
+                  <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">
+                    No closed trades recorded yet in the SQLite journal.
                   </td>
                 </tr>
               </tbody>
@@ -161,24 +202,10 @@
 
           <div class="feed-container" id="feed-container">
             <div class="feed-item">
-              <div class="feed-time">19:35:10</div>
+              <div class="feed-time">--:--:--</div>
               <div class="feed-content">
-                <div class="feed-headline">⚡ Engine Initialized & Indicators Primed</div>
-                <div class="feed-detail">Multi-timeframe series loaded (1m, 5m, 15m) for BTCUSDT, ETHUSDT, SOLUSDT. WebSocket streams connected.</div>
-              </div>
-            </div>
-            <div class="feed-item">
-              <div class="feed-time">19:35:11</div>
-              <div class="feed-content">
-                <div class="feed-headline">🔍 Regime Classifier Scan Complete</div>
-                <div class="feed-detail">BTCUSDT: BULL_TREND (EMA9 > EMA21 > EMA50, OFI: +2.4). Maker Post-Only bracket order calculated.</div>
-              </div>
-            </div>
-            <div class="feed-item" style="border-left-color: var(--accent-emerald);">
-              <div class="feed-time">19:35:12</div>
-              <div class="feed-content">
-                <div class="feed-headline">🟢 Autonomous Limit Order Placed: Buy 0.05 BTCUSDT</div>
-                <div class="feed-detail">Price: $64,250.00 | Native TP: $64,550.00 (1.2× ATR) | SL: $64,050.00 (0.8× ATR) | TimeInForce: PostOnly</div>
+                <div class="feed-headline">⚡ Engine Telemetry Ready</div>
+                <div class="feed-detail">Awaiting real-time execution and regime events from Bybit V5 streams.</div>
               </div>
             </div>
           </div>
@@ -200,8 +227,8 @@
           <div class="cb-list">
             <div class="cb-item">
               <div>
-                <div class="cb-name">Daily Max Drawdown (2.5%)</div>
-                <div style="font-size: 0.7rem; color: var(--text-muted);">Current: 0.00%</div>
+                <div class="cb-name" id="cb-dd-name">Daily Max Drawdown (2.5%)</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);" id="cb-dd-current">Current: 0.00%</div>
               </div>
               <span class="cb-badge cb-active" id="cb-dd-badge">ACTIVE / OK</span>
             </div>
@@ -217,17 +244,51 @@
             <div class="cb-item">
               <div>
                 <div class="cb-name">3-Sigma Volatility Spike</div>
-                <div style="font-size: 0.7rem; color: var(--text-muted);">Threshold: > 3.0 Std Dev</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);">Threshold: > 3.0 Std Dev / 1.8% Bar</div>
               </div>
-              <span class="cb-badge cb-active" id="cb-vol-badge">NORMAL</span>
+              <span class="cb-badge cb-active" id="cb-vol-badge">ACTIVE / OK</span>
             </div>
 
             <div class="cb-item">
               <div>
-                <div class="cb-name">Chop Suppressor</div>
-                <div style="font-size: 0.7rem; color: var(--text-muted);">Rejects low-vol mean-reverting churn</div>
+                <div class="cb-name">Chop & BTC Lead-Lag Filter</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);">Rejects low-vol churn & macro dumps</div>
               </div>
               <span class="cb-badge cb-active">FILTER ON</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Self-Adaptive Learning Parameters -->
+        <div class="card">
+          <div class="section-header">
+            <h2 class="section-title">
+              <span>🧠 Self-Adaptive Tuning & RL</span>
+            </h2>
+            <span class="brand-tag">Online Learner</span>
+          </div>
+
+          <div style="display: flex; flex-direction: column; gap: 0.6rem; font-size: 0.8rem; font-family: var(--font-mono);">
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-secondary);">Take Profit Multiplier:</span>
+              <span id="param-tp" style="color: var(--accent-emerald);">1.20 × ATR</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-secondary);">Stop Loss Multiplier:</span>
+              <span id="param-sl" style="color: var(--accent-rose);">0.80 × ATR</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+              <span style="color: var(--text-secondary);">Kelly Scaling Factor:</span>
+              <span id="param-kelly" style="color: var(--accent-cyan);">0.50 (Half-Kelly)</span>
+            </div>
+          </div>
+
+          <div style="margin-top: 1rem; padding-top: 0.85rem; border-top: 1px solid var(--border-subtle);">
+            <div style="font-size: 0.72rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.6rem; font-weight: 600;">
+              Regime Expectancy Weights
+            </div>
+            <div id="learner-weights-list" style="display: flex; flex-direction: column; gap: 0.45rem; font-size: 0.75rem; font-family: var(--font-mono);">
+              <div style="color: var(--text-muted);">Calibrating regime weights...</div>
             </div>
           </div>
         </div>
@@ -250,41 +311,16 @@
               <span style="color: #fff;">AWS Singapore (ap-southeast-1)</span>
             </div>
             <div style="display: flex; justify-content: space-between; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border-subtle);">
-              <span style="color: var(--text-secondary);">Interconnect Latency:</span>
-              <span style="color: var(--accent-emerald); font-weight: 700;">~5.2 ms (Sub-10ms)</span>
+              <span style="color: var(--text-secondary);">Heartbeat Freshness:</span>
+              <span id="infra-heartbeat" style="color: var(--accent-emerald); font-weight: 700;">Live (< 2s)</span>
             </div>
             <div style="display: flex; justify-content: space-between; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border-subtle);">
               <span style="color: var(--text-secondary);">WebSocket Protocol:</span>
-              <span style="color: var(--accent-cyan);">WSS V5 (Keepalive: 20s)</span>
+              <span style="color: var(--accent-cyan);">WSS V5 (JSON Ping: 20s)</span>
             </div>
             <div style="display: flex; justify-content: space-between;">
-              <span style="color: var(--text-secondary);">IP Whitelist Binding:</span>
-              <span style="color: var(--accent-emerald);">Bound (Static IPv4)</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Self-Adaptive Learning Parameters -->
-        <div class="card">
-          <div class="section-header">
-            <h2 class="section-title">
-              <span>🧠 Self-Adaptive Tuning</span>
-            </h2>
-            <span class="brand-tag">Every 20 Trades</span>
-          </div>
-
-          <div style="display: flex; flex-direction: column; gap: 0.6rem; font-size: 0.8rem; font-family: var(--font-mono);">
-            <div style="display: flex; justify-content: space-between;">
-              <span style="color: var(--text-secondary);">Take Profit Multiplier:</span>
-              <span id="param-tp" style="color: var(--accent-emerald);">1.20 × ATR</span>
-            </div>
-            <div style="display: flex; justify-content: space-between;">
-              <span style="color: var(--text-secondary);">Stop Loss Multiplier:</span>
-              <span id="param-sl" style="color: var(--accent-rose);">0.80 × ATR</span>
-            </div>
-            <div style="display: flex; justify-content: space-between;">
-              <span style="color: var(--text-secondary);">Kelly Scaling Factor:</span>
-              <span id="param-kelly" style="color: var(--accent-cyan);">0.50 (Half-Kelly)</span>
+              <span style="color: var(--text-secondary);">Execution Strategy:</span>
+              <span style="color: var(--accent-emerald);">PostOnly + 2-Tier Lock</span>
             </div>
           </div>
         </div>
@@ -295,7 +331,24 @@
 
   </main>
 
-  <div class="toast" id="toast"></div>
+  <!-- Native Modal Dialog for Emergency Panic Confirmation -->
+  <dialog id="panic-dialog" class="panic-modal" closedby="any">
+    <div class="panic-modal-header">
+      <span style="font-size: 1.5rem;">🛑</span>
+      <h3>Confirm Emergency Panic Liquidation</h3>
+    </div>
+    <p class="panic-modal-body">
+      This will immediately cancel <strong>all open orders</strong> and submit <strong>reduce-only Market orders</strong> to flatten every open position on your Bybit account, halting further trading.
+    </p>
+    <div class="panic-modal-actions">
+      <button type="button" class="btn-modal-cancel" onclick="closePanicModal()">Cancel</button>
+      <button type="button" class="btn-panic" onclick="confirmPanicExecution()">
+        <span>🚨 Execute Panic Stop</span>
+      </button>
+    </div>
+  </dialog>
+
+  <div class="toast" id="toast" popover="manual" role="status" aria-live="polite"></div>
 
   <script src="app.js"></script>
 </body>

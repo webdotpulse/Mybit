@@ -218,14 +218,23 @@ class TradeJournal:
                 "avg_trade_pnl": round(float(np.mean(pnls)), 2),
             }
 
+    def has_trade(self, trade_id: str) -> bool:
+        """Checks whether a trade_id has already been recorded in the SQLite journal."""
+        if not trade_id:
+            return False
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM trades WHERE trade_id = ? LIMIT 1", (trade_id,))
+            return cursor.fetchone() is not None
+
     def get_window_metrics(self, hours: int = 24) -> Dict[str, Any]:
         """Calculates performance statistics for a recent time window (e.g. past 24 hours)."""
-        cutoff = int(time.time()) - (hours * 3600)
+        cutoff_ms = int((time.time() - (hours * 3600)) * 1000)
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT realized_pnl, realized_pnl_pct, fee_paid FROM trades WHERE exit_time >= ?",
-                (cutoff,)
+                (cutoff_ms,)
             )
             rows = cursor.fetchall()
             if not rows:
@@ -268,6 +277,7 @@ class ParameterAutoTuner:
     def __init__(self, journal: TradeJournal, config: AppConfig):
         self.journal = journal
         self.config = config
+        self._last_tuned_trade_count: int = 0
 
     def evaluate_and_tune(self) -> Optional[Dict[str, Any]]:
         """
@@ -278,9 +288,15 @@ class ParameterAutoTuner:
         - Kelly scale: [0.2, 0.8]
         """
         interval = self.config.strategy.auto_tuning_trade_interval
+        total_count = self.journal.get_total_trade_count()
+        if total_count < interval or (total_count - self._last_tuned_trade_count) < interval:
+            return None
+
         recent = self.journal.get_recent_trades(limit=interval)
         if len(recent) < interval:
             return None
+
+        self._last_tuned_trade_count = total_count
 
         pnls = [t["realized_pnl"] for t in recent]
         wins = [p for p in pnls if p > 0]
@@ -485,4 +501,21 @@ class OnlineStrategyLearner:
 
     def get_weight(self, key: str) -> float:
         return self.weights.get(key, 1.0)
+
+    def get_weights_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Returns a structured summary of learned regime/feature multipliers and trade counts."""
+        summary: Dict[str, Dict[str, Any]] = {}
+        for k, w in self.weights.items():
+            st = self.stats.get(k, {})
+            wins = int(st.get("wins", 0))
+            losses = int(st.get("losses", 0))
+            summary[k] = {
+                "multiplier": round(float(w), 3),
+                "trades": wins + losses,
+                "wins": wins,
+                "losses": losses,
+                "total_pnl": round(float(st.get("total_pnl", 0.0)), 4),
+            }
+        return summary
+
 

@@ -82,6 +82,17 @@ class OrderBookL2:
         sorted_bids = sorted(self.bids.keys(), reverse=True)
         sorted_asks = sorted(self.asks.keys())
 
+        # Prune far out-of-the-money levels to keep L2 book memory bounded and sorting fast
+        max_cache_levels = max(100, self.depth_levels * 3)
+        if len(sorted_bids) > max_cache_levels:
+            for p in sorted_bids[max_cache_levels:]:
+                self.bids.pop(p, None)
+            sorted_bids = sorted_bids[:max_cache_levels]
+        if len(sorted_asks) > max_cache_levels:
+            for p in sorted_asks[max_cache_levels:]:
+                self.asks.pop(p, None)
+            sorted_asks = sorted_asks[:max_cache_levels]
+
         best_bid_p = sorted_bids[0]
         best_bid_v = self.bids[best_bid_p]
         best_ask_p = sorted_asks[0]
@@ -287,6 +298,7 @@ class BybitV5Client:
         params: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
         auth_required: bool = True,
+        _retries: int = 0,
     ) -> Dict[str, Any]:
         """
         High-performance REST dispatcher for Bybit V5 with signature calculation,
@@ -384,13 +396,14 @@ class BybitV5Client:
                 ret_msg = res_json.get("retMsg", f"HTTP {status_code}")
 
                 if ret_code != 0:
-                    # 10006 = rate limit hit
-                    if ret_code == 10006:
+                    # 10006 = rate limit hit (bounded to max 3 retries)
+                    if ret_code == 10006 and _retries < 3:
+                        backoff_sec = 1.5 * (_retries + 1)
                         logger.warning(
-                            f"Rate limit reached on Bybit V5: {ret_msg}. Backing off 1.5s."
+                            f"Rate limit reached on Bybit V5: {ret_msg}. Backing off {backoff_sec:.1f}s (retry {_retries + 1}/3)."
                         )
-                        await asyncio.sleep(1.5)
-                        return await self.request(method, path, params, data, auth_required)
+                        await asyncio.sleep(backoff_sec)
+                        return await self.request(method, path, params, data, auth_required, _retries=_retries + 1)
 
                     if ret_code == 10010:
                         logger.error(
@@ -751,8 +764,7 @@ class BybitV5Client:
                 logger.info(f"Connecting to Private WS: {self.ws_private_url}")
                 async with websockets.connect(
                     self.ws_private_url,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=None,  # Handled by native Bybit JSON ping loop
                     close_timeout=5,
                 ) as ws:
                     self._private_ws = ws

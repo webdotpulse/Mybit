@@ -370,12 +370,12 @@ class QuantitativeBacktester:
             # ----------------------------------------------------
             if open_pos is None and bar.timestamp >= cooldown_until_ts:
                 # Synthesize simulated top-of-book orderbook snapshot
-                spread = max(0.0001, bar.close * 0.0002)  # ~2 bps spread
-                best_bid = round(bar.close - (spread / 2.0), 5)
-                best_ask = round(bar.close + (spread / 2.0), 5)
+                spread = max(0.00001, bar.close * 0.0002)  # ~2 bps spread
+                best_bid = round(bar.close - (spread / 2.0), 6)
+                best_ask = round(bar.close + (spread / 2.0), 6)
                 ob = OrderBookL2(symbol)
-                ob.bids = {best_bid: 500.0, best_bid - spread: 1000.0}
-                ob.asks = {best_ask: 500.0, best_ask + spread: 1000.0}
+                ob.bids = {best_bid: 500.0, round(best_bid - spread, 6): 1000.0}
+                ob.asks = {best_ask: 500.0, round(best_ask + spread, 6): 1000.0}
                 # Synthetic buyer/seller imbalance from candle delta
                 candle_delta = bar.close - bar.open
                 ob.ofi = 15.0 if candle_delta > 0 else (-15.0 if candle_delta < 0 else 0.0)

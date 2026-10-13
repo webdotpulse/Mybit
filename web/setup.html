@@ -31,9 +31,14 @@
         
         <!-- API Credentials Section -->
         <div style="margin-bottom: 1.5rem; border-bottom: 1px solid var(--border-subtle); padding-bottom: 1rem;">
-          <h3 style="font-size: 1rem; color: var(--accent-cyan); margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem;">
-            <span>🔑</span> Bybit V5 API Credentials
-          </h3>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.5rem;">
+            <h3 style="font-size: 1rem; color: var(--accent-cyan); display: flex; align-items: center; gap: 0.5rem;">
+              <span>🔑</span> Bybit V5 API Credentials
+            </h3>
+            <span id="cred-status-badge" class="brand-tag" style="display: none; background: rgba(0, 245, 155, 0.15); color: var(--accent-emerald); border-color: rgba(0, 245, 155, 0.35);">
+              ✓ Encrypted Key Stored
+            </span>
+          </div>
 
           <div class="form-group">
             <label class="form-label" for="api-key">Bybit API Key</label>
@@ -48,8 +53,8 @@
           <div class="form-group">
             <label class="form-label" for="network-env">Environment</label>
             <select class="form-select" id="network-env">
-              <option value="testnet" selected>Testnet (api-testnet.bybit.com) — Recommended for verification</option>
-              <option value="mainnet">Live Mainnet (api.bybit.com)</option>
+              <option value="testnet">Testnet (api-testnet.bybit.com) — Verification Mode</option>
+              <option value="mainnet" selected>Live Mainnet (api.bybit.com)</option>
             </select>
           </div>
         </div>
@@ -71,12 +76,12 @@
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
             <div class="form-group">
               <label class="form-label" for="capital">Allocated Capital ($ USD)</label>
-              <input class="form-input" type="number" id="capital" value="1000" min="50" step="50" required>
+              <input class="form-input" type="number" id="capital" value="1000" min="10" step="10" required>
             </div>
 
             <div class="form-group">
               <label class="form-label" for="daily-risk">Max Daily Risk / Drawdown %</label>
-              <input class="form-input" type="number" id="daily-risk" value="2.5" min="0.5" max="10" step="0.1" required>
+              <input class="form-input" type="number" id="daily-risk" value="2.5" min="0.5" max="15" step="0.1" required>
             </div>
           </div>
 
@@ -84,6 +89,17 @@
             <label class="form-label" for="pairs">Target Trading Pairs</label>
             <input class="form-input" type="text" id="pairs" value="BTCUSDT, ETHUSDT, SOLUSDT" required>
             <div style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.3rem;">Multi-timeframe features (1m, 5m, 15m) and Order Flow Imbalance will be computed for each pair.</div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 0.75rem;">
+            <label style="display: flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; color: var(--text-primary); cursor: pointer;">
+              <input type="checkbox" id="auto-tier" checked style="accent-color: var(--accent-cyan); width: 16px; height: 16px;">
+              <span>Auto-Adapt Tier to Live Equity</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; color: var(--text-primary); cursor: pointer;">
+              <input type="checkbox" id="auto-scan" checked style="accent-color: var(--accent-cyan); width: 16px; height: 16px;">
+              <span>Autonomous Volatility Pair Scanner</span>
+            </label>
           </div>
         </div>
 
@@ -96,7 +112,7 @@
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
             <div class="form-group">
               <label class="form-label" for="tg-token">Telegram Bot Token</label>
-              <input class="form-input" type="password" id="tg-token" placeholder="Optional bot token">
+              <input class="form-input" type="password" id="tg-token" placeholder="Optional bot token" autocomplete="off">
             </div>
 
             <div class="form-group">
@@ -107,21 +123,78 @@
         </div>
 
         <button type="submit" class="btn-primary" id="btn-save">
-          <span>⚡ Save Configuration & Initialize Autonomous Daemon</span>
+          <span>⚡ Save Configuration & Apply Settings</span>
         </button>
       </form>
     </div>
   </main>
 
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast" popover="manual" role="status" aria-live="polite"></div>
 
   <script>
+    let hasStoredCredentials = false;
+    let hasStoredTelegramToken = false;
+
     function showToast(msg, isSuccess = true) {
       const toast = document.getElementById('toast');
-      toast.style.display = 'block';
       toast.style.borderColor = isSuccess ? 'var(--accent-emerald)' : 'var(--accent-rose)';
       toast.innerText = msg;
-      setTimeout(() => { toast.style.display = 'none'; }, 4000);
+      if (typeof toast.showPopover === 'function') {
+        try { toast.showPopover(); } catch (e) { toast.style.display = 'block'; }
+      } else {
+        toast.style.display = 'block';
+      }
+      setTimeout(() => {
+        if (typeof toast.hidePopover === 'function') {
+          try { toast.hidePopover(); } catch (e) {}
+        }
+        toast.style.display = 'none';
+      }, 4000);
+    }
+
+    async function loadExistingConfig() {
+      try {
+        const resp = await fetch('/api/config');
+        if (!resp.ok) return;
+        const cfg = await resp.json();
+
+        if (cfg.has_credentials) {
+          hasStoredCredentials = true;
+          const badge = document.getElementById('cred-status-badge');
+          badge.style.display = 'inline-block';
+          badge.innerText = `✓ Key On File (${cfg.masked_key || 'Encrypted'})`;
+
+          const keyInput = document.getElementById('api-key');
+          const secInput = document.getElementById('api-secret');
+          keyInput.required = false;
+          secInput.required = false;
+          keyInput.placeholder = `Leave blank to keep stored key (${cfg.masked_key})`;
+          secInput.placeholder = 'Leave blank to keep stored secret';
+        }
+
+        document.getElementById('network-env').value = cfg.testnet ? 'testnet' : 'mainnet';
+        if (cfg.trading_mode) document.getElementById('trading-mode').value = cfg.trading_mode;
+        if (cfg.capital !== undefined) document.getElementById('capital').value = cfg.capital;
+        if (cfg.daily_risk_pct !== undefined) document.getElementById('daily-risk').value = cfg.daily_risk_pct;
+        if (Array.isArray(cfg.symbols) && cfg.symbols.length > 0) {
+          document.getElementById('pairs').value = cfg.symbols.join(', ');
+        }
+        if (cfg.auto_tier_by_equity !== undefined) {
+          document.getElementById('auto-tier').checked = Boolean(cfg.auto_tier_by_equity);
+        }
+        if (cfg.auto_scan_symbols !== undefined) {
+          document.getElementById('auto-scan').checked = Boolean(cfg.auto_scan_symbols);
+        }
+        if (cfg.telegram_chat_id) {
+          document.getElementById('tg-chat').value = cfg.telegram_chat_id;
+        }
+        if (cfg.has_telegram_token) {
+          hasStoredTelegramToken = true;
+          document.getElementById('tg-token').placeholder = 'Leave blank to keep stored bot token';
+        }
+      } catch (e) {
+        // Ignore offline errors
+      }
     }
 
     async function handleSetupSubmit(e) {
@@ -133,6 +206,8 @@
       const capital = parseFloat(document.getElementById('capital').value);
       const dailyRisk = parseFloat(document.getElementById('daily-risk').value);
       const pairs = document.getElementById('pairs').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+      const autoTier = document.getElementById('auto-tier').checked;
+      const autoScan = document.getElementById('auto-scan').checked;
       const tgToken = document.getElementById('tg-token').value.trim();
       const tgChat = document.getElementById('tg-chat').value.trim();
 
@@ -143,8 +218,10 @@
         trading_mode: mode,
         capital: capital,
         daily_risk_pct: dailyRisk,
+        auto_tier_by_equity: autoTier,
+        auto_scan_symbols: autoScan,
         symbols: pairs,
-        telegram_enabled: Boolean(tgToken && tgChat),
+        telegram_enabled: Boolean((tgToken || hasStoredTelegramToken) && tgChat),
         telegram_bot_token: tgToken || null,
         telegram_chat_id: tgChat || null
       };
@@ -157,15 +234,17 @@
         });
         const res = await resp.json();
         if (res.success) {
-          showToast('✓ Credentials encrypted and config written successfully! Redirecting...', true);
-          setTimeout(() => { window.location.href = 'index.html'; }, 1500);
+          showToast('✓ Configuration saved and encrypted! Redirecting to dashboard...', true);
+          setTimeout(() => { window.location.href = 'index.html'; }, 1400);
         } else {
           showToast('✕ Error: ' + res.error, false);
         }
       } catch (err) {
-        showToast('✓ Configuration updated locally (Offline mode).', true);
+        showToast('✕ Network error saving configuration.', false);
       }
     }
+
+    loadExistingConfig();
   </script>
 </body>
 </html>

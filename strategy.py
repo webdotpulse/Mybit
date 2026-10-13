@@ -269,16 +269,16 @@ class TimeframeSeries:
             return 0.0, 0.0, c
 
         y = closes[-period:]
-        x = np.arange(period)
-        cov = np.cov(x, y)[0, 1]
-        var_x = np.var(x)
+        x = np.arange(period, dtype=float)
+        cov = np.cov(x, y, ddof=0)[0, 1]
+        var_x = np.var(x, ddof=0)
         slope = float(cov / var_x) if var_x > 0 else 0.0
         intercept = float(np.mean(y) - slope * np.mean(x))
         y_pred = slope * x + intercept
 
         ss_tot = float(np.sum((y - np.mean(y)) ** 2))
         ss_res = float(np.sum((y - y_pred) ** 2))
-        r2 = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+        r2 = float(max(0.0, 1.0 - (ss_res / ss_tot))) if ss_tot > 0 else 0.0
         next_forecast = float(slope * period + intercept)
 
         return slope, r2, next_forecast
@@ -445,9 +445,11 @@ class StrategyEngine:
         Enforces multi-horizon linear regression forecasting, ADX trend strength,
         Wilder RSI, and Bollinger Band structure.
         """
-        tf_1m = self.series[symbol].get("1m")
-        tf_5m = self.series[symbol].get("5m")
-        tf_15m = self.series[symbol].get("15m")
+        self.ensure_symbol(symbol)
+        sym_map = self.series[symbol]
+        tf_1m = sym_map.get("1m") or sym_map.get("1")
+        tf_5m = sym_map.get("5m") or sym_map.get("5")
+        tf_15m = sym_map.get("15m") or sym_map.get("15")
 
         if not tf_1m or len(tf_1m.bars) < self.strat_cfg.ema_slow:
             return MarketRegime.LOW_VOL_CHOP, {}
@@ -700,6 +702,9 @@ class StrategyEngine:
                     logger.debug(f"[{symbol}] Suppressed SHORT entry: BTC macro lead trend is Bullish.")
                     return None
 
+        def _round_px(val: float) -> float:
+            return round(val, 6) if val < 1.0 else round(val, 4)
+
         # 1. High-Conviction Trend Pullback (Dip Buying / Rally Selling)
         if regime == MarketRegime.TREND_PULLBACK:
             pullback_side = metrics.get("pullback_side", 1.0)
@@ -709,9 +714,9 @@ class StrategyEngine:
                     return None
                 price = get_maker_price("Buy", best_bid)
                 tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
-                tp_price = round(price + tp_dist, 4)
-                sl_price = round(price - sl_dist, 4)
-                tp1_price = round(price + tp1_dist, 4)
+                tp_price = _round_px(price + tp_dist)
+                sl_price = _round_px(price - sl_dist)
+                tp1_price = _round_px(price + tp1_dist)
                 conviction = get_conviction(0.85, "trend_pullback")
 
                 return Signal(
@@ -736,9 +741,9 @@ class StrategyEngine:
                     return None
                 price = get_maker_price("Sell", best_ask)
                 tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
-                tp_price = round(price - tp_dist, 4)
-                sl_price = round(price + sl_dist, 4)
-                tp1_price = round(price - tp1_dist, 4)
+                tp_price = _round_px(price - tp_dist)
+                sl_price = _round_px(price + sl_dist)
+                tp1_price = _round_px(price - tp1_dist)
                 conviction = get_conviction(0.85, "trend_pullback")
 
                 return Signal(
@@ -761,15 +766,18 @@ class StrategyEngine:
         # 2. Mean-Reversion Scalping in Range/Chop
         if regime == MarketRegime.MEAN_REVERSION_RANGE:
             range_side = metrics.get("range_side", 1.0)
+            tp1_bps = getattr(self.exec_cfg, "tp1_bps", 75.0)
             if range_side > 0:
                 side = "Buy"
                 if is_funding_adverse(side):
                     return None
-                price = best_bid
+                price = get_maker_price("Buy", best_bid)
                 tp_dist = max(1.10 * atr, price * 0.0030)
                 sl_dist = max(0.85 * atr, price * 0.0022)
-                tp_price = round(price + tp_dist, 4)
-                sl_price = round(price - sl_dist, 4)
+                tp1_dist = min(tp_dist, price * (tp1_bps / 10000.0))
+                tp_price = _round_px(price + tp_dist)
+                sl_price = _round_px(price - sl_dist)
+                tp1_price = _round_px(price + tp1_dist)
                 conviction = get_conviction(0.75, "mean_reversion")
 
                 return Signal(
@@ -785,16 +793,20 @@ class StrategyEngine:
                     time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
                     leverage=self.risk_cfg.default_leverage,
                     metadata=metrics,
+                    tp1_price=tp1_price,
+                    tp2_price=tp_price,
                 )
             else:
                 side = "Sell"
                 if is_funding_adverse(side):
                     return None
-                price = best_ask
+                price = get_maker_price("Sell", best_ask)
                 tp_dist = max(1.10 * atr, price * 0.0030)
                 sl_dist = max(0.85 * atr, price * 0.0022)
-                tp_price = round(price - tp_dist, 4)
-                sl_price = round(price + sl_dist, 4)
+                tp1_dist = min(tp_dist, price * (tp1_bps / 10000.0))
+                tp_price = _round_px(price - tp_dist)
+                sl_price = _round_px(price + sl_dist)
+                tp1_price = _round_px(price - tp1_dist)
                 conviction = get_conviction(0.75, "mean_reversion")
 
                 return Signal(
@@ -810,6 +822,8 @@ class StrategyEngine:
                     time_in_force="PostOnly" if self.exec_cfg.maker_first else "GTC",
                     leverage=self.risk_cfg.default_leverage,
                     metadata=metrics,
+                    tp1_price=tp1_price,
+                    tp2_price=tp_price,
                 )
 
         # 3. High-Conviction Breakout Momentum (Volatility Expansion)
@@ -823,11 +837,11 @@ class StrategyEngine:
                 base_atr = atr_5m if atr_5m > 0 else atr
                 tp_dist = max(breakout_tp * base_atr, price * 0.0040)
                 sl_dist = max(sl_atr_mult * base_atr, price * 0.0028)
-                tp_price = round(price + tp_dist, 4)
-                sl_price = round(price - sl_dist, 4)
+                tp_price = _round_px(price + tp_dist)
+                sl_price = _round_px(price - sl_dist)
                 tp1_bps = getattr(self.exec_cfg, "tp1_bps", 75.0)
                 tp1_dist = price * (tp1_bps / 10000.0)
-                tp1_price = round(price + tp1_dist, 4)
+                tp1_price = _round_px(price + tp1_dist)
                 conviction = get_conviction(0.80, "volatility_expansion")
 
                 return Signal(
@@ -854,11 +868,11 @@ class StrategyEngine:
                 base_atr = atr_5m if atr_5m > 0 else atr
                 tp_dist = max(breakout_tp * base_atr, price * 0.0040)
                 sl_dist = max(sl_atr_mult * base_atr, price * 0.0028)
-                tp_price = round(price - tp_dist, 4)
-                sl_price = round(price + sl_dist, 4)
+                tp_price = _round_px(price - tp_dist)
+                sl_price = _round_px(price + sl_dist)
                 tp1_bps = getattr(self.exec_cfg, "tp1_bps", 75.0)
                 tp1_dist = price * (tp1_bps / 10000.0)
-                tp1_price = round(price - tp1_dist, 4)
+                tp1_price = _round_px(price - tp1_dist)
                 conviction = get_conviction(0.80, "volatility_expansion")
 
                 return Signal(
@@ -886,9 +900,9 @@ class StrategyEngine:
                 return None
             price = get_maker_price("Buy", best_bid)
             tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
-            tp_price = round(price + tp_dist, 4)
-            sl_price = round(price - sl_dist, 4)
-            tp1_price = round(price + tp1_dist, 4)
+            tp_price = _round_px(price + tp_dist)
+            sl_price = _round_px(price - sl_dist)
+            tp1_price = _round_px(price + tp1_dist)
             conviction = get_conviction(0.78, "trend_momentum")
 
             return Signal(
@@ -914,9 +928,9 @@ class StrategyEngine:
                 return None
             price = get_maker_price("Sell", best_ask)
             tp_dist, sl_dist, tp1_dist = get_bracket_distances(price, is_5m_wave=True)
-            tp_price = round(price - tp_dist, 4)
-            sl_price = round(price + sl_dist, 4)
-            tp1_price = round(price - tp1_dist, 4)
+            tp_price = _round_px(price - tp_dist)
+            sl_price = _round_px(price + sl_dist)
+            tp1_price = _round_px(price - tp1_dist)
             conviction = get_conviction(0.78, "trend_momentum")
 
             return Signal(

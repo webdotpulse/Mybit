@@ -53,6 +53,9 @@ def render_status() -> None:
 
     # Status & Account Card
     engine_state = data.get("status", "STOPPED / OFFLINE")
+    last_ts = int(data.get("timestamp", 0) or 0)
+    if engine_state == "RUNNING" and last_ts > 0 and (time.time() - last_ts) > 30:
+        engine_state = f"STOPPED / STALE ({int(time.time() - last_ts)}s ago)"
     state_style = "bold green" if engine_state == "RUNNING" else "bold red"
 
     equity = data.get("equity", config.risk.allocated_capital_usd)
@@ -114,9 +117,14 @@ def render_status() -> None:
 
     # 2. Consecutive Losses
     losses = cb.get("consecutive_losses", 0)
+    max_losses = config.risk.max_consecutive_losses
     in_cooldown = cb.get("in_cooldown", False)
     rem_sec = cb.get("cooldown_remaining_sec", 0)
-    loss_status = f"[bold red]COOLDOWN ({rem_sec}s)[/bold red]" if in_cooldown else f"[bold green]{losses}/4 losses[/bold green]"
+    loss_status = (
+        f"[bold red]COOLDOWN ({rem_sec}s)[/bold red]"
+        if in_cooldown
+        else f"[bold green]{losses}/{max_losses} losses[/bold green]"
+    )
     cb_table.add_row(
         "Consecutive Loss Cutoff",
         loss_status,
@@ -151,6 +159,7 @@ def render_status() -> None:
     pos_table.add_column("Entry Price", justify="right")
     pos_table.add_column("Mark Price", justify="right")
     pos_table.add_column("Unrealized PnL", justify="right")
+    pos_table.add_column("TP / SL", justify="right")
     pos_table.add_column("Leverage", justify="center")
 
     if positions:
@@ -159,6 +168,10 @@ def render_status() -> None:
             pnl = p["unrealised_pnl"]
             pnl_style = "bold green" if pnl >= 0 else "bold red"
             sign = "+" if pnl >= 0 else ""
+            tp_val = p.get("tp_price") or p.get("take_profit")
+            sl_val = p.get("sl_price") or p.get("stop_loss")
+            tp_s = f"[green]${tp_val:,.4f}[/green]" if tp_val else "[dim]-[/dim]"
+            sl_s = f"[red]${sl_val:,.4f}[/red]" if sl_val else "[dim]-[/dim]"
             pos_table.add_row(
                 p["symbol"],
                 side_str,
@@ -166,10 +179,11 @@ def render_status() -> None:
                 f"${p['entry_price']:,.4f}",
                 f"${p['mark_price']:,.4f}",
                 f"[{pnl_style}]{sign}${pnl:.2f}[/{pnl_style}]",
+                f"{tp_s} / {sl_s}",
                 f"{p['leverage']}x",
             )
     else:
-        pos_table.add_row("[dim]None[/dim]", "-", "-", "-", "-", "-", "-")
+        pos_table.add_row("[dim]None[/dim]", "-", "-", "-", "-", "-", "-", "-")
 
     console.print(pos_table)
 
